@@ -94,6 +94,31 @@ class StudioTests(unittest.TestCase):
         self.assertNotIn('images',result['versions'][0])
         self.assertEqual(self.store.get('versions','v-source')['images'],[{'huge':'snapshot'}])
 
+    def test_compact_state_preserves_full_labels_for_editor_and_previews(self):
+        image=self.annotate(self.image())
+        image['original_source']={'large_metadata':'preserved'}
+        self.store.put('images',image)
+        code,state=self.req('/api/state?compact=1')
+        self.assertEqual(code,200)
+        brief=state['images'][0]
+        self.assertTrue(brief['_summary'])
+        self.assertEqual(brief['annotations'],[{'class_id':'1'}])
+        self.assertNotIn('original_source',brief)
+        code,detail=self.req('/api/images/'+image['id'])
+        self.assertEqual(detail['annotations'],image['annotations'])
+        self.assertEqual(detail['original_source'],image['original_source'])
+        code,previews=self.req('/api/image-previews?ids='+image['id'])
+        self.assertEqual(previews[0]['annotations'][0]['points'],image['annotations'][0]['points'])
+        self.assertEqual(previews[0]['revision'],image['revision'])
+        self.assertEqual(self.store.get('images',image['id']),image)
+
+    def test_activity_does_not_include_image_collection(self):
+        self.image()
+        code,activity=self.req('/api/activity')
+        self.assertEqual(code,200)
+        self.assertNotIn('images',activity)
+        self.assertIn('jobs',activity)
+
     def test_conflict_and_invalid_polygon_leave_data_unchanged(self):
         x=self.image(); updated=self.annotate(x)
         code,_=self.req('/api/images/'+x['id'],dict(revision=x['revision'],note='stale'))
@@ -167,6 +192,50 @@ class StudioTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'완료 배치만'):
             self.studio.create_version(dict(name='reject-review',train_batches=[images[4]['batch']]))
         self.assertEqual(len(self.store.all('versions')),3)
+
+    def test_completed_reviewed_unsplit_uploads_cannot_silently_disappear_from_version(self):
+        old=self.image(batch='old');self.studio.save_batch(dict(id=old['batch'],stage='done'))
+        self.studio.bulk(dict(ids=[old['id']],changes=dict(split='train')))
+        new=self.annotate(self.image(name='new.png',shade=112,batch='newData - mix'))
+        self.studio.save_batch(dict(id=new['batch'],stage='done'))
+        code,preview=self.req('/api/versions/preview',{})
+        self.assertEqual(code,200);self.assertEqual(preview['counts']['train'],1)
+        self.assertEqual(preview['pending_count'],1)
+        self.assertEqual(preview['pending_batches'][0]['name'],'newData - mix')
+        code,result=self.req('/api/versions',dict(name='must-not-silently-ignore'))
+        self.assertEqual(code,400);self.assertIn('미분할 사진 1장',result['error'])
+        self.assertEqual(self.store.all('versions'),[])
+        self.assertEqual(self.store.get('images',new['id'])['split'],'')
+        self.studio.bulk(dict(ids=[new['id']],changes=dict(split='train')))
+        code,version=self.req('/api/versions',dict(name='new-data-included'))
+        self.assertEqual(code,200);self.assertEqual(version['counts']['train'],2)
+        self.assertEqual(version['selection_audit']['pending_count'],0)
+        with tempfile.TemporaryDirectory(dir=self.temp.name) as folder:
+            self.studio.materialize(version,folder)
+            coco=json.loads((Path(folder)/'train.json').read_text(encoding='utf8'))
+            self.assertEqual({x['file_name'] for x in coco['images']},{old['file'],new['file']})
+
+    def test_version_pending_respects_filters_and_explicit_train_batch_scope(self):
+        old=self.image(batch='ready');self.studio.save_batch(dict(id=old['batch'],stage='done'))
+        self.studio.bulk(dict(ids=[old['id']],changes=dict(split='train')))
+        new=self.image(name='pending.png',shade=113,batch='pending');self.studio.save_batch(dict(id=new['batch'],stage='done'))
+        auto=self.image(name='auto.png',shade=114,batch='pending');auto=self.annotate(auto,status='auto')
+        preview=self.studio.preview_version(dict(train_batches=[old['batch']]))
+        self.assertEqual(preview['pending_count'],0)
+        self.assertEqual(preview['excluded']['automatic_label'],1)
+        self.assertEqual(preview['excluded']['unselected_batch'],1)
+        self.assertEqual(self.studio.preview_version(dict(reviewed_only=True))['pending_count'],0)
+        self.assertEqual(self.studio.preview_version(dict(include_background=False))['pending_count'],0)
+        self.assertEqual(self.studio.preview_version({})['pending_count'],1)
+        self.assertEqual(self.studio.create_version(dict(train_batches=[old['batch']]))['counts']['train'],1)
+
+    def test_version_commit_rechecks_uploads_arriving_after_preview(self):
+        old=self.image();self.studio.save_batch(dict(id=old['batch'],stage='done'))
+        self.studio.bulk(dict(ids=[old['id']],changes=dict(split='train')))
+        self.assertEqual(self.studio.preview_version({})['pending_count'],0)
+        self.image(name='late.png',shade=115)
+        self.assertEqual(self.req('/api/versions',dict(name='stale-preview'))[0],400)
+        self.assertEqual(self.store.all('versions'),[])
 
     def test_unconfigured_training_is_not_fake_success(self):
         self.assertEqual(self.req('/api/jobs',dict(mode='train',model_type='other'))[0],400)

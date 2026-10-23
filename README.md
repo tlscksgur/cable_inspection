@@ -49,3 +49,12 @@ python -m unittest discover -s . -p "test_*.py" -v
 
 이 저장소의 테스트는 임시 데이터·모의 ML 환경을 사용합니다.
 실제 GPU 추론·성능 평가는 모델과 데이터가 준비된 환경에서 별도로 수행해야 합니다.
+
+## Latest source update (2026-10-23)
+
+Includes pending-image safeguards for version creation, split previews,
+filter-aware batch selection, finetune epoch-zero validation and scored checkpoint
+selection, evaluation class handling, SSH session helpers and current UI.
+EfficientAD integration sources are included; its separate models and deployment
+are still required. Example server paths must be configured for your environment.
+No operational data, machine-specific handoff reports or credentials are included.

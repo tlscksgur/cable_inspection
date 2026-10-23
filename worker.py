@@ -99,6 +99,76 @@ def preserve_previous_best(runner,checkpoint,work):
         runner.message_hub.update_info(key,str(target))
 
 
+def selected_best_checkpoint(runner,work):
+    """Return the scored checkpoint, never infer quality from file timestamps."""
+    value=runner.message_hub.get_info('best_ckpt')
+    if not value:raise RuntimeError('검증 기준 최고 체크포인트가 기록되지 않았습니다')
+    checkpoint=Path(value).resolve()
+    if checkpoint.parent!=Path(work).resolve() or not checkpoint.is_file():
+        raise RuntimeError('최고 체크포인트의 저장 위치를 확인할 수 없습니다')
+    return checkpoint
+
+
+def remap_classification_state(source,target,source_classes,target_classes):
+    """Copy every shared tensor exactly, remapping only RTMDet class output rows."""
+    old_ids=[c['id'] for c in source_classes];new_ids=[c['id'] for c in target_classes]
+    if len(set(old_ids))!=len(old_ids) or len(set(new_ids))!=len(new_ids) or not set(old_ids)<=set(new_ids):
+        raise ValueError('추가 학습 클래스 ID 구성이 올바르지 않습니다')
+    for c in source_classes:
+        dst=target_classes[new_ids.index(c['id'])]
+        if c['name']!=dst['name'] or bool(c.get('normal'))!=bool(dst.get('normal')):
+            raise ValueError('기존 클래스의 의미가 달라졌습니다: '+c['name'])
+    if set(source)!=set(target):
+        missing=sorted(set(target)-set(source));extra=sorted(set(source)-set(target))
+        raise ValueError('추가 학습 모델 구조가 다릅니다: missing='+str(missing[:5])+', extra='+str(extra[:5]))
+    aligned={};heads=[]
+    for key,fresh in target.items():
+        prior=source[key]
+        if key.startswith('bbox_head.rtm_cls.') and key.endswith(('.weight','.bias')):
+            if prior.shape[0]!=len(old_ids) or fresh.shape[0]!=len(new_ids) or prior.shape[1:]!=fresh.shape[1:]:
+                raise ValueError('분류 출력의 크기가 클래스 정보와 다릅니다: '+key)
+            value=fresh.clone()
+            for src_idx,class_id in enumerate(old_ids):value[new_ids.index(class_id)]=prior[src_idx]
+            aligned[key]=value;heads.append(key)
+        else:
+            if prior.shape!=fresh.shape:raise ValueError('클래스 출력 외의 가중치 크기가 다릅니다: '+key)
+            aligned[key]=prior
+    if not heads:raise ValueError('RTMDet 분류 출력 가중치를 찾지 못했습니다')
+    return aligned,dict(copied_tensors=len(target)-len(heads),remapped_class_tensors=heads,
+                        preserved_classes=[c['name'] for c in source_classes],
+                        initialized_classes=[c['name'] for c in target_classes if c['id'] not in old_ids])
+
+
+def prepare_finetune_checkpoint(cfg,spec,work):
+    import torch
+    from mmdet.registry import MODELS
+    from mmengine.runner.checkpoint import _load_checkpoint
+    plan=spec['finetune_class_transfer']
+    checkpoint=_load_checkpoint(spec['checkpoint'],map_location='cpu')
+    actual=checkpoint.get('meta',{}).get('dataset_meta',{}).get('classes')
+    if actual is not None and list(actual)!=[c['name'] for c in plan['source_classes']]:
+        raise ValueError('체크포인트에 저장된 클래스 순서가 원본 모델 정보와 다릅니다')
+    source=checkpoint.get('state_dict',checkpoint)
+    if source and all(k.startswith('module.') for k in source):source={k[7:]:v for k,v in source.items()}
+    # CPU initialization supplies the proper low-prior bias for newly added classes.
+    model=MODELS.build(cfg.model);model.init_weights()
+    target=model.state_dict()
+    state,report=remap_classification_state(source,target,plan['source_classes'],plan['target_classes'])
+    old_ids=[c['id'] for c in plan['source_classes']];new_ids=[c['id'] for c in plan['target_classes']]
+    for key,prior in source.items():
+        if key in report['remapped_class_tensors']:
+            if any(not torch.equal(prior[i],state[key][new_ids.index(cid)]) for i,cid in enumerate(old_ids)):
+                raise ValueError('기존 분류 가중치 보존 확인에 실패했습니다: '+key)
+        elif not torch.equal(prior,state[key]):raise ValueError('기존 가중치 보존 확인에 실패했습니다: '+key)
+    report['all_original_weights_verified']=True
+    path=Path(work)/'finetune_initial.pth'
+    # Fine-tune weights only: stale optimizer, EMA, epoch and best scores are not reused.
+    torch.save(dict(state_dict=state,meta=dict(dataset_meta=dict(classes=tuple(c['name'] for c in plan['target_classes'])))),path)
+    report.update(source_model_id=plan['source_model_id'],source_model_name=plan['source_model_name'])
+    write(Path(work)/'class_transfer.json',report)
+    return str(path)
+
+
 def run(spec):
     import torch
     import codecs
@@ -191,6 +261,10 @@ def run(spec):
         cfg[f'{name}_evaluator']=dict(type='StudioCocoMetric' if spec.get('fast_mask_encoding',True) else 'CocoMetric',ann_file=str(root/'valid.json'),metric=['bbox','segm'],format_only=False)
     cfg.work_dir=str(work); cfg.launcher='none'
     cfg.env_cfg=dict(cudnn_benchmark=False,mp_cfg=dict(mp_start_method='spawn',opencv_num_threads=0),dist_cfg=dict(backend='nccl'))
+    if mode=='train' and spec.get('finetune_class_transfer') and not spec.get('resume'):
+        if spec.get('start_mode')!='finetune':raise ValueError('클래스 전달은 추가 학습에서만 사용할 수 있습니다')
+        status(message='기존 클래스 가중치 보존 · 새 클래스 출력 준비 중',progress=0)
+        cfg.load_from=prepare_finetune_checkpoint(cfg,spec,work)
     if mode=='eval':
         configure_evaluation(cfg,spec['checkpoint'])
     config_path=work/'training_config.py'; cfg.dump(str(config_path))
@@ -211,7 +285,8 @@ def run(spec):
                        message=f'valid 평가 중 · {batch_idx+1}/{total}' if batch_idx+1<total else 'valid 추론 완료 · mAP 집계 중')
         runner.register_hook(EvalProgress())
         metrics=runner.test()
-        write(spec['result_path'],dict(metrics=metrics,version_id=spec['version_id'],split='valid')); return
+        write(spec['result_path'],dict(metrics=metrics,version_id=spec['version_id'],split='valid',
+                                      evaluation_scope=spec.get('evaluation_scope'))); return
     from mmengine.hooks import Hook
     class Progress(Hook):
         def before_train_epoch(self,runner):self.started=time.perf_counter()
@@ -243,11 +318,26 @@ def run(spec):
                 # validation first instead of waiting another five epochs.
                 runner.val_loop.run()
         runner.register_hook(ValidateRecoveredCheckpoint(),priority='LOWEST')
+    elif spec.get('start_mode')=='finetune' and not spec.get('resume'):
+        class ValidateFineTuneStartingPoint(Hook):
+            def before_train(self,runner):
+                # Same classes/data/EMA and scoring hook as later validations.
+                # CheckpointHook includes epoch 0 among best candidates, so a
+                # degraded fine-tune cannot replace its better starting weights.
+                status(message='추가 학습 전 시작 모델 성능 확인 중',progress=0)
+                metrics=runner.val_loop.run()
+                write(work/'finetune_baseline.json',dict(metrics=metrics,source_model_id=spec.get('source_model_id'),
+                                                       source_model_name=spec.get('source_model_name')))
+        runner.register_hook(ValidateFineTuneStartingPoint(),priority='LOWEST')
     runner.train()
-    best=list(work.glob('best_coco_segm_mAP_50*.pth'))
-    if not best: raise RuntimeError('검증 기준 최고 체크포인트가 만들어지지 않았습니다')
+    best=selected_best_checkpoint(runner,work)
     metrics=runner.message_hub.get_info('best_score')
-    write(spec['result_path'],dict(checkpoint=str(max(best,key=lambda p:p.stat().st_mtime)),config=str(config_path),metrics={'best_mask_mAP50':metrics}))
+    result=dict(checkpoint=str(best),config=str(config_path),metrics={'best_mask_mAP50':metrics})
+    baseline=work/'finetune_baseline.json'
+    if baseline.exists():result['finetune_baseline']=json.loads(baseline.read_text(encoding='utf8'))
+    transfer_report=work/'class_transfer.json'
+    if transfer_report.exists():result['class_transfer']=json.loads(transfer_report.read_text(encoding='utf-8'))
+    write(spec['result_path'],result)
 
 
 if __name__=='__main__':

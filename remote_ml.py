@@ -41,22 +41,21 @@ def parse_gpu_csv(text):
 
 
 class RemoteBackend:
-    def __init__(self,password):
+    def __init__(self,password=None):
         deps=Path(__file__).parent/'.runtime'/'python_deps'
         if str(deps) not in sys.path:sys.path.insert(0,str(deps))
         try:import paramiko
         except ImportError:raise RuntimeError('SSH 실행 모듈 Paramiko를 설치하세요') from None
-        self.client=paramiko.SSHClient()
-        self.client.load_system_host_keys()
-        # Known host verification is mandatory; never trust a changed host key silently.
-        self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        from ssh_auth import open_client
+        self.client=None
         try:
-            self.client.connect(HOST,username=USER,password=password,look_for_keys=True,allow_agent=True,
-                                timeout=10,auth_timeout=15,banner_timeout=15)
+            self.client=open_client(paramiko,password)
         except paramiko.AuthenticationException:
-            self.client.close();raise ValueError('서버 로그인에 실패했습니다. cable 비밀번호를 확인하세요.') from None
+            if self.client:self.client.close()
+            raise ValueError('서버 인증에 실패했습니다. SSH 키 등록 또는 비밀번호를 확인하세요.') from None
         except Exception as e:
-            self.client.close();raise RuntimeError('SSH 접속을 확인하세요: '+type(e).__name__) from None
+            if self.client:self.client.close()
+            raise RuntimeError('SSH 접속을 확인하세요: '+type(e).__name__) from None
         self.client.get_transport().set_keepalive(20)
         probe="""import json, pathlib, torch, mmdet, mmcv.ops
 p=pathlib.Path(mmdet.__file__).resolve()

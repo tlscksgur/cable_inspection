@@ -78,6 +78,39 @@ function pointer(h,x,y,label){return {button:0,pointerId:1,clientX:x,clientY:y,d
 async function reopen(h,image){await h.context.editor.closeEditor();h.context.editor.openEditor(image,h.state,async()=>{});}
 async function classClick(h,id){await h.elements.get('#main').handlers.click({target:{closest:selector=>selector==='[data-editor-class]'?{dataset:{editorClass:id}}:null}});}
 
+for(const method of ['Enter','first-point','double-click'])test(`polygon closes and saves over HTTP without crypto.randomUUID: ${method}`,async()=>{
+ const h=harness(),svg=h.elements.get('#editor-svg');
+ const webcrypto=require('node:crypto').webcrypto;
+ h.context.crypto={getRandomValues:webcrypto.getRandomValues.bind(webcrypto)};
+ for(const [x,y] of [[50,50],[150,50],[150,150]])svg.handlers.pointerdown(pointer(h,x,y));
+ if(method==='Enter')await h.key('Enter','Enter');
+ else if(method==='first-point')svg.handlers.pointerdown(pointer(h,50,50));
+ else svg.handlers.dblclick({preventDefault(){}});
+ await h.click('save');
+ const annotations=h.requests.at(-1)?.body.annotations;
+ assert.equal(annotations?.length,1,h.messages.join('; '));
+ assert.equal(annotations[0].points.length,3);
+ assert.match(annotations[0].id,/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+ assert.equal(h.elements.get('#draft').innerHTML,'');
+});
+
+test('boxes also save over HTTP without crypto.randomUUID',async()=>{
+ const h=harness(),svg=h.elements.get('#editor-svg'),webcrypto=require('node:crypto').webcrypto;
+ h.context.crypto={getRandomValues:webcrypto.getRandomValues.bind(webcrypto)};
+ await h.click('box');svg.handlers.pointerdown(pointer(h,50,50));svg.handlers.pointermove(pointer(h,150,150));svg.handlers.pointerup({pointerId:1});
+ await h.click('save');assert.equal(h.requests.at(-1)?.body.annotations[0].points.length,4);
+});
+
+test('double pointer click closes even when SVG repaint suppresses native dblclick',async()=>{
+ const h=harness(),svg=h.elements.get('#editor-svg');
+ for(const [x,y,timeStamp] of [[50,50,100],[150,50,200],[150,150,300],[150,150,350]])
+  svg.handlers.pointerdown({...pointer(h,x,y),detail:0,timeStamp});
+ await h.click('save');
+ assert.equal(h.requests.at(-1)?.body.annotations.length,1);
+ assert.equal(h.requests.at(-1).body.annotations[0].points.length,3);
+ assert.equal(h.elements.get('#draft').innerHTML,'');
+});
+
 test('review advance retains drawing tool and class but does not copy labels',async()=>{
  const h=harness();h.state.classes.push({id:'2',name:'dent',color:'#ff0000',shortcut:'2'});
  await h.click('box');await classClick(h,'2');await h.click('review');

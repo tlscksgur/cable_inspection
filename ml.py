@@ -7,6 +7,69 @@ from pathlib import Path
 from services import integer, now, uid
 
 
+def finetune_class_transfer(version,model,size):
+    """Allow added classes without discarding any learned class meanings."""
+    if model['size']!=size:
+        raise ValueError('추가 학습할 모델 크기가 다릅니다. '+model['size'].upper()+' 크기를 선택하세요')
+    old=model['classes'];new=version['classes']
+    old_ids=[c['id'] for c in old];new_ids=[c['id'] for c in new]
+    if old_ids!=model['class_ids'] or len(set(old_ids))!=len(old_ids) or len(set(new_ids))!=len(new_ids):
+        raise ValueError('모델 또는 버전의 클래스 정보가 일치하지 않습니다')
+    target={c['id']:c for c in new}
+    if any(c['id'] not in target for c in old):
+        raise ValueError('기존 모델의 클래스를 삭제한 버전으로는 추가 학습할 수 없습니다')
+    for c in old:
+        other=target[c['id']]
+        if (c['name'],bool(c.get('normal')))!=(other['name'],bool(other.get('normal'))):
+            raise ValueError('기존 클래스의 이름 또는 정상/결함 구분이 바뀌었습니다: '+c['name'])
+    if len({c['name'] for c in new})!=len(new):raise ValueError('중복된 클래스 이름이 있습니다')
+    added=[c for c in new if c['id'] not in old_ids]
+    labelled={a['class_id'] for x in version['images'] if x['split']=='train' for a in x['annotations']}
+    missing=[c['name'] for c in added if c['id'] not in labelled]
+    if missing:raise ValueError('추가 클래스의 train 라벨이 필요합니다: '+', '.join(missing))
+    if old_ids==new_ids:return None
+    return dict(source_classes=old,target_classes=new,added_classes=[c['name'] for c in added],
+                source_model_id=model['id'],source_model_name=model['name'])
+
+
+def align_evaluation_classes(version, model):
+    """Keep checkpoint output indices intact; only omit unlabelled normal extras."""
+    import copy
+    model_classes=model['classes']
+    ids=[c['id'] for c in model_classes]
+    if ids!=model['class_ids'] or len(set(ids))!=len(ids):
+        raise ValueError('모델에 저장된 클래스 정보가 일치하지 않습니다')
+    version_ids=[c['id'] for c in version['classes']]
+    if len(set(version_ids))!=len(version_ids):
+        raise ValueError('평가 버전에 중복된 클래스 ID가 있습니다')
+    source={c['id']:c for c in version['classes']}
+    target={c['id']:c for c in model_classes}
+    labelled={a['class_id'] for x in version['images'] if x['split']=='valid'
+              for a in x['annotations']}
+    if labelled-set(source):
+        raise ValueError('평가 정답에 버전의 클래스 목록에 없는 라벨이 있습니다')
+    for key in source.keys() & target.keys():
+        if (source[key]['name'],bool(source[key].get('normal'))) != (target[key]['name'],bool(target[key].get('normal'))):
+            raise ValueError('같은 클래스 ID의 이름 또는 정상/결함 구분이 달라 평가할 수 없습니다: '+source[key]['name'])
+    omitted=[c for c in version['classes'] if c['id'] not in target]
+    added=[c for c in model_classes if c['id'] not in source]
+    blocked=[c['name'] for c in omitted if not c.get('normal') or c['id'] in labelled]
+    blocked.extend(c['name'] for c in added if not c.get('normal'))
+    if blocked:
+        raise ValueError('모델과 평가 버전의 클래스가 다릅니다: '+', '.join(blocked)+
+                         '. valid 정답이 없는 추가 정상 클래스만 자동으로 맞출 수 있습니다')
+    aligned=copy.deepcopy(version)
+    aligned['images']=[x for x in aligned['images'] if x['split']=='valid']
+    aligned['classes']=copy.deepcopy(model_classes)
+    scope=dict(model_classes=[c['name'] for c in model_classes],
+               labelled_classes=[c['name'] for c in model_classes if c['id'] in labelled],
+               omitted_unlabelled_normal_classes=[c['name'] for c in omitted],
+               model_only_unlabelled_normal_classes=[c['name'] for c in added],
+               reordered=ids!=version_ids,
+               note='모델의 출력 클래스 순서로 평가합니다. valid 정답이 없는 클래스는 COCO mAP 평균에서 제외됩니다.')
+    return aligned,scope
+
+
 class ML:
     def __init__(self, studio):
         self.studio=studio
@@ -25,10 +88,34 @@ class ML:
                     self.info=dict(ready=False,reason='MMDetection RTMDet-Ins 설정 파일을 찾을 수 없습니다.')
             except Exception:
                 self.info=dict(ready=False,reason='실행 환경을 확인할 수 없습니다. 서버 설정과 Python 경로를 확인하세요.')
+        self.start_auto_connection()
         for job in studio.store.all('jobs'):
             if job['status'] in ('running','queued'):
                 job.update(status='interrupted',message='서버가 재시작되어 중단되었습니다. 다시 시작하세요.')
                 studio.store.put('jobs',job)
+
+    def start_auto_connection(self):
+        from ssh_auth import auto_available
+        if not auto_available():return
+        if getattr(self,'_auto_thread',None) and self._auto_thread.is_alive():return
+        self._auto_thread=threading.Thread(target=self._auto_loop,name='studio-ssh-reconnect',daemon=True)
+        self._auto_thread.start()
+
+    def _auto_loop(self):
+        import time
+        from remote_ml import RemoteBackend
+        while True:
+            try:
+                with self.lock:
+                    transport=self.remote.client.get_transport() if self.remote else None
+                    if not transport or not transport.is_active():
+                        self.info=dict(ready=False,reason='AI 서버에 자동 연결 중입니다.')
+                        candidate=RemoteBackend()
+                        old=self.remote;self.remote=candidate;self.root=candidate.root;self.info=candidate.info
+                        if old:old.close()
+            except Exception:
+                self.info=dict(ready=False,reason='AI 서버 자동 연결을 재시도하고 있습니다. 서버와 네트워크를 확인하세요.')
+            time.sleep(15)
 
     def connect_remote(self,body):
         from remote_ml import RemoteBackend
@@ -71,8 +158,10 @@ class ML:
                 if not 0<spec['lr']<=1: raise ValueError('학습률 범위를 확인하세요')
                 if body.get('resume_model'):
                     model=self.studio.store.get('models',body['resume_model'])
-                    if model['class_ids']!=[c['id'] for c in version['classes']] or model['size']!=size: raise ValueError('이어서 학습할 모델의 클래스와 크기가 일치해야 합니다')
+                    transfer=finetune_class_transfer(version,model,size)
+                    if transfer:spec['finetune_class_transfer']=transfer
                     spec['checkpoint']=model['checkpoint']
+                    spec['source_model_id']=model['id'];spec['source_model_name']=model['name']
                     spec['start_mode']='finetune'
                 else:
                     spec['checkpoint']=None
@@ -85,8 +174,7 @@ class ML:
                 if mode=='eval':
                     version=self.studio.store.get('versions',body['version_id'])
                     if not version['counts'].get('valid'):raise ValueError('valid 사진이 있는 버전을 선택하세요')
-                    if [c['id'] for c in version['classes']]!=model['class_ids']: raise ValueError('평가 버전과 모델의 클래스 순서가 다릅니다')
-                    spec['version']=version
+                    spec['version'],spec['evaluation_scope']=align_evaluation_classes(version,model)
                 else:
                     ids=body.get('image_ids',[])
                     if not ids: raise ValueError('예측할 사진을 선택하세요')

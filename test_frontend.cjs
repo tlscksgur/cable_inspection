@@ -30,11 +30,24 @@ async function harness(storage=new Map()) {
     .replace(/^export \{predictionForm\};$/m,'');
   source=source.slice(0,source.indexOf('\ntry{document.documentElement.dataset.theme'));
   const shortcuts=fs.readFileSync(path.join(__dirname,'web/shortcuts.js'),'utf8').replace(/\bexport\s+/g,'');
-  await vm.runInContext(`(async()=>{${shortcuts}\n${source}\nglobalThis.client={appendImages,observeImageList,visibleImageLimit,setImageSelected,handleImageCardClick,validationFromLog,syncValidationProgress,rememberLastEditor,resumeLabelingButton,imagesPage,copyJobLog,jobProgress,syncJobCenter,syncTrainingMode,trainingForm,gpuStatus,settingsPage,boardColumns,trainBatchChoices,modelTable,comparisonChart,comparisonVersion,comparedModels,importedModelDetails,syncUploadedBoard,uploadFiles,rememberTrainingForm,restoreTrainingForm,renderPage,setParams(v){params=new URLSearchParams(v);},setState(v){state=v;},setRoute(v){route=v;},setPending(v){pendingTrainingVersion=v;}};})()`,context);
+  await vm.runInContext(`(async()=>{${shortcuts}\n${source}\nglobalThis.client={appendImages,observeImageList,visibleImageLimit,setImageSelected,handleImageCardClick,validationFromLog,syncValidationProgress,rememberLastEditor,resumeLabelingButton,imagesPage,copyJobLog,jobProgress,syncJobCenter,syncTrainingMode,trainingForm,gpuStatus,settingsPage,boardColumns,trainBatchChoices,versionPreviewHTML,modelTable,comparisonChart,comparisonVersion,comparedModels,importedModelDetails,syncUploadedBoard,uploadFiles,rememberTrainingForm,restoreTrainingForm,renderPage,setParams(v){params=new URLSearchParams(v);},setState(v){state=v;},setRoute(v){route=v;},setPending(v){pendingTrainingVersion=v;}};})()`,context);
   const state={images:[],batches:[],classes:[],versions:[],models:[],jobs:[],events:[],settings:{},connection:{demo:true,ml:{ready:false}}};
   context.fetch=async()=>({ok:true,json:async()=>state});context.client.setState(state);context.client.setRoute('board');
   return {context,client:context.client,elements,upload,location,state};
 }
+
+test('image test opens in place without refetching the full state or reloading the page',async()=>{
+  const h=await harness();
+  h.location.hash='#/test';h.location.pathname='/cable/';h.location.origin='http://server:7777';
+  h.context.inspectionPage=()=>'<div>test-view</div>';
+  let target;
+  h.context.mountInspection=options=>{target=options.baseUrl;};
+  h.context.fetch=async()=>{throw Error('navigation must not fetch state');};
+  await h.client.renderPage();
+  assert.equal(h.elements.get('#main').innerHTML,'<div>test-view</div>');
+  assert.equal(target,'http://server:7777/cable/test');
+  assert.equal(h.location.hash,'#/test');
+});
 
 test('upload refresh adds the batch while preserving the page and upload form',async()=>{
   const h=await harness();h.elements.get('#main').innerHTML='page-must-stay';
@@ -266,4 +279,12 @@ test('latest completed evaluation selects its dataset and a different dataset ex
 test('train batch choices show only populated done batches and bind actual IDs',async()=>{
  const h=await harness();h.client.setState({batches:[{id:'review-first',name:'검수 배치',stage:'review'},{id:'done-real',name:'완료 배치',stage:'done'},{id:'done-empty',name:'빈 완료',stage:'done'}],images:[{id:'r',batch:'review-first',split:'train',status:'reviewed'},{id:'d',batch:'done-real',split:'train',status:'reviewed'}]});
  const html=h.client.trainBatchChoices();assert.match(html,/완료 배치/);assert.match(html,/value="done-real"/);assert.doesNotMatch(html,/검수 배치|빈 완료|review-first/);
+});
+
+
+test('pending done batches stay selectable and version preview explains omitted new uploads',async()=>{
+ const h=await harness();h.client.setState({batches:[{id:'new',name:'newData <serial>',stage:'done'},{id:'review',name:'not-done',stage:'review'}],images:[{batch:'new',split:'',status:'reviewed'},{batch:'review',split:'',status:'reviewed'}]});
+ const choices=h.client.trainBatchChoices();assert.match(choices,/value="new"/);assert.match(choices,/미분할 1장/);assert.doesNotMatch(choices,/not-done/);
+ const html=h.client.versionPreviewHTML({counts:{train:3465,valid:963,test:440},pending_count:80,pending_batches:[{id:'new',name:'newData <serial>',count:52},{id:'mix',name:'newData - mix',count:28}],excluded:{automatic_label:37}});
+ assert.match(html,/80장/);assert.match(html,/52장/);assert.match(html,/28장/);assert.match(html,/분할 적용/);assert.match(html,/3,465/);assert.match(html,/newData &lt;serial&gt;/);assert.doesNotMatch(html,/<serial>/);
 });

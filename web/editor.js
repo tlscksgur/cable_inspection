@@ -3,6 +3,14 @@ import {shortcutActions,eventShortcut,resolvedShortcuts,shortcutLabel} from './s
 
 let current=null;
 const editorPreferences={tool:"polygon",classId:null};
+function annotationId(){
+ // randomUUID is secure-context-only; shared LAN HTTP still supports getRandomValues.
+ if(typeof crypto.randomUUID==='function')return crypto.randomUUID();
+ const bytes=crypto.getRandomValues(new Uint8Array(16));
+ bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128;
+ const hex=Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');
+ return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
 export async function closeEditor(){
  if(!current)return;
  const old=current;
@@ -77,7 +85,7 @@ export function openEditor(source,state,refresh){
   if(pts.length<3)return;
   const area=Math.abs(pts.reduce((n,p,i)=>n+p[0]*pts[(i+1)%pts.length][1]-pts[(i+1)%pts.length][0]*p[1],0))/2;
   if(area<1){toast('면적이 있는 다각형을 그려주세요',true);return;}
-  history();const a={id:crypto.randomUUID(),class_id:c.classId,points:structuredClone(pts),source:'human'};image.annotations.push(a);c.selected=a.id;c.points=[];mark();paint();
+  const id=annotationId();history();const a={id,class_id:c.classId,points:structuredClone(pts),source:'human'};image.annotations.push(a);c.selected=a.id;c.points=[];c.lastPointClick=null;mark();paint();
  }
  function choose(tool){if(c.points.length){toast('Enter로 완성하거나 Esc로 취소하세요');return;}c.tool=tool;editorPreferences.tool=tool;paint();}
  function chooseClass(id){
@@ -115,7 +123,12 @@ export function openEditor(source,state,refresh){
   if(c.tool==='box'){c.drag={type:'box',start:pos};c.points=[pos,pos,pos,pos];svg.setPointerCapture(e.pointerId);paint();return;}
   if(c.tool==='polygon'){
    if(c.points.length>=3&&Math.hypot(pos[0]-c.points[0][0],pos[1]-c.points[0][1])<c.view.w/svg.clientWidth*10){finish();return;}
-   if(e.detail<2)c.points.push(pos);paint();
+   // paint replaces SVG children, so browsers can lose the native dblclick target.
+   const last=c.lastPointClick;
+   const repeated=c.points.length&&last&&Number.isFinite(e.timeStamp)&&e.timeStamp-last.time>=0&&e.timeStamp-last.time<=400&&Math.hypot(e.clientX-last.x,e.clientY-last.y)<=6;
+   if(repeated){if(c.points.length>=3)finish();return;}
+   c.lastPointClick={time:e.timeStamp,x:e.clientX,y:e.clientY};
+   c.points.push(pos);paint();
   }
  },{signal});
  svg.addEventListener('pointermove',e=>{

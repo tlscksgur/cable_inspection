@@ -1,5 +1,7 @@
+import {efficientADPage,mountEfficientAD,prepareEfficientAD} from './efficientad.js';
 import {openEditor, closeEditor} from './editor.js';
 import {shortcutActions,eventShortcut,resolvedShortcuts,validateShortcuts,shortcutLabel} from './shortcuts.js';
+import {inspectionPage,mountInspection} from './inspect.js';
 
 export const icons = {
  grid:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
@@ -33,7 +35,7 @@ export const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 export const num=v=>Number(v||0).toLocaleString('ko-KR');
 export const date=v=>v?new Date(v).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'Asia/Seoul'}):'—';
 export const btn=(text,action,ico='',style='')=>`<button class="btn ${style}" data-action="${action}">${ico?icon(ico):''}${text}</button>`;
-export async function api(path,body){const r=await fetch(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error||'요청 실패');return j;}
+export async function api(path,body){const r=await fetch(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let j;try{j=await r.json();}catch{throw Error(`서버 연결 오류 (${r.status}). start.cmd 실행 상태를 확인하세요.`);}if(!r.ok)throw Error(j.error||'요청 실패');return j;}
 let toastTimer;
 export function toast(message,error=false){const el=document.querySelector('#toast');el.textContent=message;el.className='visible'+(error?' error':'');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.className='',4500);}
 export function modal(title,content){const el=document.querySelector('#modal');el.dataset.view='';document.querySelector('#modal-body').innerHTML=`<div class="modalhead"><h2>${esc(title)}</h2><button class="iconbtn" data-action="close-modal" aria-label="닫기">${icon('close')}</button></div>${content}`;if(!el.open)el.showModal();}
@@ -45,6 +47,7 @@ async function copyJobLog(){
 export function closeModal(){document.querySelector('#modal').close();}
 export let state;
 let route='',params=new URLSearchParams(),selected=new Set(),splitPreview=null,renderToken=0;
+let workspaceMode=localStorage.getItem('studio-model-workspace')==='efficientad'?'efficientad':'rtmdet',switchingWorkspace=false,disposeEfficientAD=null;
 let trainingDraft=null,pendingTrainingVersion=null,uploading=false,uploadDraft=null,uploadResultHtml='';
 const stages={new:'새로 올림',labeling:'라벨링 중',review:'검수',done:'완료'};
 const statuses={todo:'검수 전',reviewed:'검수 완료',ambiguous:'애매',auto:'자동 라벨',ai_reviewed:'AI 검수'};
@@ -74,13 +77,24 @@ async function refreshGPU(){
 }
 function header(){
  const jobs=state.jobs.filter(j=>['running','queued'].includes(j.status)).length;
- document.querySelector('#header').innerHTML=`<div class="brandbar"><a class="brand" href="#/"><span class="brandmark">d</span><span class="brandname">dxel <span>Studio</span></span><span class="workspace">${esc(state.settings.project_name||"케이블 표면 검사")}</span></a><div class="header-actions"><div id="gpu-status">${gpuStatus()}</div><span class="connection"><span class="dot ${state.connection.demo?'amber':''}"></span>${state.connection.demo?'샘플 데이터 · DB 연결 전':'로컬 작업 공간'}</span><button class="btn small" data-action="jobs">${icon('clock','small')}작업 센터 ${jobs?badge(jobs,'blue'):''}</button><button class="iconbtn" data-action="theme" aria-label="밝게/어둡게 바꾸기">${icon('sun')}</button><a class="avatar" href="#/settings" aria-label="설정">신</a></div></div><div class="navwrap"><nav class="topnav" aria-label="주 메뉴">${nav.map(([id,text,ico])=>id==='|'?'<span class="navsep"></span>':`<a href="#/${id}" class="${(route.split('/')[0]===id||route.startsWith('annotate')&&id==='images')?'active':''}" ${route===id?'aria-current="page"':''}>${icon(ico)}${text}</a>`).join('')}</nav></div>`;
+ document.querySelector('#header').innerHTML=`<div class="brandbar"><a class="brand" href="#/"><span class="brandmark">d</span><span class="brandname">dxel <span>Studio</span></span><span class="workspace">${esc(state.settings.project_name||"케이블 표면 검사")}</span></a><div class="model-workspace-switch" role="group" aria-label="모델 작업 공간"><button data-workspace="rtmdet" ${switchingWorkspace?'disabled':''} class="${workspaceMode==='rtmdet'?'active':''}" aria-pressed="${workspaceMode==='rtmdet'}">RTMDet</button><button data-workspace="efficientad" ${switchingWorkspace?'disabled':''} class="${workspaceMode==='efficientad'?'active':''}" aria-pressed="${workspaceMode==='efficientad'}">EfficientAD</button></div><div class="header-actions"><div id="gpu-status">${gpuStatus()}</div><span class="connection"><span class="dot ${state.connection.demo?'amber':''}"></span>${state.connection.demo?'샘플 데이터 · DB 연결 전':'로컬 작업 공간'}</span><button class="btn small" data-action="jobs">${icon('clock','small')}작업 센터 ${jobs?badge(jobs,'blue'):''}</button><button class="iconbtn" data-action="theme" aria-label="밝게/어둡게 바꾸기">${icon('sun')}</button><a class="avatar" href="#/settings" aria-label="설정">신</a></div></div><div class="navwrap" ${workspaceMode==='efficientad'?'hidden':''}><nav class="topnav" aria-label="주 메뉴">${nav.map(([id,text,ico])=>id==='|'?'<span class="navsep"></span>':`<a href="#/${id}" class="${(route.split('/')[0]===id||route.startsWith('annotate')&&id==='images')?'active':''}" ${route===id?'aria-current="page"':''}>${icon(ico)}${text}</a>`).join('')}</nav></div>`;
 }
-export async function refresh(render=true){if(render)await closeEditor();state=await api('/api/state');await syncValidationProgress();header();syncJobCenter();if(render)await renderPage();}
+export async function refresh(render=true){if(render)await closeEditor();state=await api('/api/state?compact=1');await syncValidationProgress();header();syncJobCenter();if(render)await renderPage();}
 function setQuery(changes){const q=new URLSearchParams(params);Object.entries(changes).forEach(([k,v])=>v?q.set(k,v):q.delete(k));q.delete('page');location.hash='/'+route+(q.size?'?'+q:'');}
 export function goImage(id){location.hash='/annotate/'+encodeURIComponent(id);}
 function summaryCount(list,key,value){return list.filter(x=>x[key]===value).length;}
-function thumb(x,labels=true){return `<img src="/media/${esc(x.file)}" alt="${esc(x.name)}" loading="lazy">${labels&&x.annotations.length?`<svg viewBox="0 0 ${x.width} ${x.height}" preserveAspectRatio="xMidYMid meet">${x.annotations.map(a=>`<polygon points="${a.points.map(p=>p.join(',')).join(' ')}" fill="${classOf(a.class_id)?.color||'#888'}22" stroke="${classOf(a.class_id)?.color||'#888'}" stroke-width="3"/>`).join('')}</svg>`:''}`;}
+const previewCache=new Map();
+function labelOverlay(x){const cached=previewCache.get(x.id),annotations=x._summary?(cached?.revision===x.revision?cached.annotations:[]):x.annotations;return annotations?.length?`<svg viewBox="0 0 ${x.width} ${x.height}" preserveAspectRatio="xMidYMid meet">${annotations.map(a=>`<polygon points="${a.points.map(p=>p.join(',')).join(' ')}" fill="${classOf(a.class_id)?.color||'#888'}22" stroke="${classOf(a.class_id)?.color||'#888'}" stroke-width="3"/>`).join('')}</svg>`:'';}
+function thumb(x,labels=true){return `<img src="/media/${esc(x.file)}" alt="${esc(x.name)}" loading="lazy">${labels?labelOverlay(x):''}`;}
+async function loadImagePreviews(){
+ const nodes=[...document.querySelectorAll('.imagecard .thumb')],missing=[];
+ for(const node of nodes){const id=node.getAttribute('href').split('/').at(-1),x=state.images.find(i=>i.id===id);if(x?._summary&&x.annotations.length&&previewCache.get(id)?.revision!==x.revision)missing.push(id);}
+ for(let offset=0;offset<missing.length;offset+=100){
+  const rows=await api('/api/image-previews?ids='+missing.slice(offset,offset+100).join(','));
+  for(const row of rows)previewCache.set(row.id,row);
+ }
+ for(const node of nodes){if(!node.isConnected)continue;const id=node.getAttribute('href').split('/').at(-1),x=state.images.find(i=>i.id===id);if(x&&x._summary){node.querySelector('svg')?.remove();node.insertAdjacentHTML('beforeend',labelOverlay(x));}}
+}
 function dashboard(){
  const images=activeImages(),reviewed=summaryCount(images,'status','reviewed'),labeled=images.filter(x=>x.annotations.length).length;
  const counts=[['전체 사진',images.length,'장','image',`${state.batches.length}개의 배치`],['라벨 있음',labeled,'장','tag',images.length?`전체의 ${Math.round(labeled/images.length*100)}%`:'사진을 추가해 시작하세요'],['검수 완료',reviewed,'장','check',images.length?`전체의 ${Math.round(reviewed/images.length*100)}%`:'검수한 사진이 여기에 표시됩니다'],['데이터셋 버전',state.versions.length,'개','layers',state.versions.at(-1)?.name||'아직 만든 버전 없음']];
@@ -135,6 +149,7 @@ function appendImages(){
  const count=document.querySelector('#image-count');if(count)count.textContent=num(images.length)+'장 · '+num(to)+'장 표시';
  const all=document.querySelector('#select-all');if(all){all.checked=to>0&&images.slice(0,to).every(x=>selected.has(x.id));all.indeterminate=images.slice(0,to).some(x=>selected.has(x.id))&&!all.checked;}
  if(to>=images.length){imageListObserver?.disconnect();sentinel.remove();}
+ loadImagePreviews().catch(e=>toast(e.message,true));
 }
 function observeImageList(){
  const sentinel=document.querySelector('#image-list-end');if(!sentinel)return;
@@ -159,22 +174,41 @@ function imagesPage(trash=false){
 }
 function trashTabs(){return `<div class="pills" aria-label="휴지통 종류"><a href="#/trash" class="${params.get('type')!=='models'?'active':''}">사진 ${num(state.images.filter(x=>x.deleted).length)}</a><a href="#/trash?type=models" class="${params.get('type')==='models'?'active':''}">모델 ${num(state.models.filter(x=>x.deleted).length)}</a></div>`;}
 function trashedModelsPage(){const models=state.models.filter(x=>x.deleted);return head('휴지통','삭제한 사진과 모델을 확인하고 복원할 수 있습니다.','','DATA LIBRARY')+trashTabs()+`<section class="card">${models.length?`<div class="tablewrap"><table class="table"><thead><tr><th>모델</th><th>종류</th><th>삭제한 때</th><th></th></tr></thead><tbody>${models.map(m=>`<tr><td><div class="modelname">${esc(m.name)}</div></td><td>RTMDet-Ins ${m.size.toUpperCase()}</td><td>${date(m.deleted_at)}</td><td><button class="btn small" data-action="model-restore" data-id="${m.id}" aria-label="${esc(m.name)} 복원">${icon('undo','small')}복원</button></td></tr>`).join('')}</tbody></table></div>`:empty('휴지통에 모델이 없습니다','모델을 삭제하면 이곳에서 복원할 수 있습니다.')}</section><p class="tiny muted">체크포인트와 학습 설정 파일은 보존됩니다. 복원한 모델은 모델 목록에서 다시 선택해 사용하세요.</p>`;}
-function bulkbar(trash){return selected.size?`<div class="bulkbar"><b class="smalltext">${selected.size}장 선택</b>${btn('선택 해제','deselect','','small')}${trash?btn('복원','restore','undo','small'):`${btn('검수 완료','review','check','small')}${btn('애매 표시','ambiguous','eye','small')}${select('bulk-split',[['','분할 변경'],['none','미배정'],['train','train'],['valid','valid'],['test','test']],'','aria-label="선택한 사진 분할 변경"')}${select('bulk-batch',[['','배치 이동'],...options(state.batches)],'','aria-label="선택한 사진 배치 이동"')}${btn('태그 추가','bulk-tags','tag','small')}${btn('자동 라벨','bulk-predict','model','small')}${btn('휴지통','trash','trash','small')}`}</div>`:'';}
+function bulkbar(trash){return selected.size?`<div class="bulkbar"><b class="smalltext">${selected.size}장 선택</b>${btn('선택 해제','deselect','','small')}${trash?btn('복원','restore','undo','small')+btn('보드로 복원','restore-board','board','small'):`${btn('검수 완료','review','check','small')}${btn('애매 표시','ambiguous','eye','small')}${select('bulk-split',[['','분할 변경'],['none','미배정'],['train','train'],['valid','valid'],['test','test']],'','aria-label="선택한 사진 분할 변경"')}${select('bulk-batch',[['','배치 이동'],...options(state.batches)],'','aria-label="선택한 사진 배치 이동"')}${btn('태그 추가','bulk-tags','tag','small')}${btn('자동 라벨','bulk-predict','model','small')}${btn('휴지통','trash','trash','small')}`}</div>`:'';}
 function uploadPanel(){return `<section class="card pad"><div class="cardhead"><div><h2>사진 추가</h2><p>올린 사진은 새 배치로 바로 나타납니다.</p></div></div><form data-form="upload-meta" id="upload-meta"><div class="formgrid three">${label('배치 이름',input('batch','','text','placeholder="비우면 자동 생성"'))}${label('태그',input('tags','','text','placeholder="쉼표로 구분"'))}${label('분할',select('split',[['','미배정 · 나중에 자동 분할'],['train','train'],['valid','valid'],['test','test']]))}</div>${check('allow_duplicates','중복 사진도 새 사진으로 추가')}</form><div class="dropzone" id="dropzone">${icon('upload')}<div><p><b>사진을 여기에 끌어다 놓으세요</b></p><p class="tiny muted" style="margin-top:6px">JPG · PNG · WEBP · BMP / 파일당 최대 80MB</p></div><label class="btn primary" for="files">${icon('plus')}파일 고르기</label><input id="files" type="file" accept="image/jpeg,image/png,image/webp,image/bmp" multiple hidden></div><div id="upload-results" aria-live="polite">${uploadResultHtml}</div><div class="hint">같은 이름이나 같은 내용의 사진은 중복으로 추가하지 않습니다. 원본 크기를 그대로 보관합니다.</div></section>`;}
 function boardColumns(){const images=activeImages(),occupied=new Set(images.map(x=>x.batch)),showEmpty=params.get('empty')==='1';return `<div class="kanban">${Object.entries(stages).map(([key,title],i)=>{const batches=state.batches.filter(b=>b.stage===key&&(showEmpty||occupied.has(b.id)));return `<section class="kanban-column" data-stage="${key}" aria-label="${title}"><div class="columnhead"><span><i class="swatch" style="background:${['#98a6bd','#7088d5','#d3ad69','#6aa18c'][i]}"></i>${title} <small>${batches.length}</small></span><small>0${i+1}</small></div>${batches.map(b=>{const xs=images.filter(x=>x.batch===b.id),review=xs.filter(x=>x.status==='reviewed').length;return `<article class="card boardcard" draggable="true" data-batch="${b.id}"><div class="row between"><h3><a href="#/images?batch=${b.id}">${esc(b.name)}</a></h3><button class="iconbtn" data-action="rename-batch" data-id="${b.id}" aria-label="${esc(b.name)} 이름 변경">···</button></div><span class="tiny muted">${num(xs.length)}장 · ${date(b.created)}</span><a class="previews" href="#/images?batch=${b.id}">${xs.slice(0,3).map(x=>`<img src="/media/${x.file}" alt="" loading="lazy">`).join('')}</a><div class="row between tiny muted"><span>검수 ${num(review)} / ${num(xs.length)}</span><span>${Math.round(review/Math.max(xs.length,1)*100)}%</span></div><div class="progress" style="margin-top:7px"><span style="width:${review/Math.max(xs.length,1)*100}%"></span></div>${select('stage',Object.entries(stages),b.stage,`data-stage-select="${b.id}" aria-label="${esc(b.name)} 단계"`)}</article>`;}).join('')||'<div class="empty tiny">여기로 배치를 끌어 놓으세요</div>'}</section>`;}).join('')}</div>`;}
 function boardPage(){return head('보드 · 사진 추가','사진을 추가하고, 배치를 옮기며 작업을 이어가세요.',`<a class="btn" href="#/board${params.get('empty')==='1'?'':'?empty=1'}">${params.get('empty')==='1'?'빈 배치 숨기기':'빈 배치 보기'}</a>`+btn('배치 합치기','merge-batches','layers')+btn('새 배치','new-batch','plus','primary'),'WORKFLOW')+`<div class="board-workspace"><section class="board-lanes" aria-label="배치 보드"><div id="board-columns">${boardColumns()}</div></section><aside class="board-upload" aria-label="사진 추가">${uploadPanel()}</aside></div>`;}
 function classesSection(){return `<div id="class-settings" style="margin-top:26px"><div class="cardhead"><h2>클래스 관리</h2>${btn('클래스 추가','new-class','plus','primary')}</div>`+`<section class="card"><div class="tablewrap"><table class="table"><thead><tr><th>클래스</th><th>구분</th><th>단축키</th><th>라벨 수</th><th></th></tr></thead><tbody>${state.classes.map(c=>`<tr><td><i class="swatch" style="background:${c.color}"></i>${esc(c.name)}</td><td>${badge(c.normal?'정상 요소':'결함',c.normal?'green':'')}</td><td><kbd>${esc(c.shortcut)||'—'}</kbd></td><td>${num(activeImages().reduce((n,x)=>n+x.annotations.filter(a=>a.class_id===c.id).length,0))}</td><td><button class="btn small" data-action="edit-class" data-id="${c.id}">수정</button></td></tr>`).join('')}</tbody></table></div></section><p class="tiny muted" style="margin-top:15px">물방울(water)과 인쇄·각인(SerialNumber)은 정상 요소로 표시합니다. 기존 버전의 클래스는 변경되지 않습니다.</p></div>`;}
 function classForm(c={}){modal(c.id?'클래스 수정':'클래스 추가',`<form data-form="class"><input type="hidden" name="id" value="${esc(c.id)}"><div class="formgrid">${label('이름',input('name',c.name||'','text','required maxlength="80"'))}${label('단축키',input('shortcut',c.shortcut||'','text','maxlength="1"'))}${label('색상',input('color',c.color||'#6881ab','color'))}</div>${check('normal','정상 요소 · 결함으로 집계하지 않음',c.normal)}<div class="actions" style="margin-top:22px"><button class="btn primary">저장</button></div></form>`);}
 function trainBatchChoices(){
- const counts=new Map();for(const x of activeImages())if(x.split==='train'&&!['auto','ai_reviewed','ambiguous'].includes(x.status))counts.set(x.batch,(counts.get(x.batch)||0)+1);
- const batches=state.batches.filter(b=>b.stage==='done'&&counts.has(b.id));
- return batches.length?batches.map(b=>`<label class="checkline"><input type="checkbox" name="train_batches" value="${esc(b.id)}">${esc(b.name)} <span class="muted">· train 최대 ${num(counts.get(b.id))}장</span></label>`).join(''):'<p class="tiny muted">train 사진이 있는 완료 배치가 없습니다. 보드에서 완료로 옮긴 뒤 확인하세요.</p>';
+ const counts=new Map(),pending=new Map();for(const x of activeImages())if(!['auto','ai_reviewed','ambiguous'].includes(x.status)){if(x.split==='train')counts.set(x.batch,(counts.get(x.batch)||0)+1);if(!x.split)pending.set(x.batch,(pending.get(x.batch)||0)+1);}
+ const batches=state.batches.filter(b=>b.stage==='done'&&(counts.has(b.id)||pending.has(b.id)));
+ return batches.length?batches.map(b=>`<label class="checkline"><input type="checkbox" name="train_batches" value="${esc(b.id)}">${esc(b.name)} <span class="muted">· train 최대 ${num(counts.get(b.id))}장${pending.has(b.id)?' · 미분할 '+num(pending.get(b.id))+'장':''}</span></label>`).join(''):'<p class="tiny muted">train 사진이 있는 완료 배치가 없습니다. 보드에서 완료로 옮긴 뒤 확인하세요.</p>';
+}
+let versionPreviewToken=0;
+function versionSelectionBody(form){
+ const fd=new FormData(form),body=Object.fromEntries(fd);
+ for(const key of ['done_only','exclude_ambiguous','reviewed_only','include_background'])body[key]=fd.has(key);
+ body.train_batches=fd.getAll('train_batches');return body;
+}
+function versionPreviewHTML(report){
+ const counts=report.counts;
+ return `<p class="smalltext"><b>이번 버전에 포함: train ${num(counts.train)} · valid ${num(counts.valid)} · test ${num(counts.test)}장</b></p>`+
+ (report.pending_count?`<div class="hint amber"><b>완료 배치의 미분할 사진 ${num(report.pending_count)}장</b><p>오른쪽 자동 분할에서 미리 보기 → 분할 적용 후 버전을 만드세요. 분할 전에는 새 사진이 학습에 들어가지 않습니다.</p>${report.pending_batches.map(b=>`<p><a href="#/images?batch=${encodeURIComponent(b.id)}">${esc(b.name)}</a> · ${num(b.count)}장</p>`).join('')}</div>`:'<p class="tiny muted">선택 범위의 미분할 사진 없음</p>')+
+ (report.excluded.automatic_label?`<p class="tiny muted">사람이 검수하지 않은 자동 라벨 ${num(report.excluded.automatic_label)}장 제외</p>`:'');
+}
+async function syncVersionPreview(){
+ const form=document.querySelector('[data-form=version]'),box=document.querySelector('#version-preview'),button=document.querySelector('#create-version');
+ if(!form||!box||!button)return;
+ const token=++versionPreviewToken;button.disabled=true;
+ try{const report=await api('/api/versions/preview',versionSelectionBody(form));if(token!==versionPreviewToken||!box.isConnected)return;box.innerHTML=versionPreviewHTML(report);button.disabled=!!report.pending_count;}
+ catch(e){if(token===versionPreviewToken)box.textContent='데이터 포함 여부를 확인하지 못했습니다: '+e.message;}
 }
 function versionBatchUsage(v){
  const used=(v.batch_snapshot||[]).filter(b=>b.counts.train>0);if(!used.length)return '';
  return `<details style="margin:12px 0"><summary class="tiny muted">사용한 완료 train 배치 ${used.length}개</summary>${used.map(b=>`<p class="tiny muted">${esc(b.name)} · train ${num(b.counts.train)}장</p>`).join('')}</details>`;
 }
-function versionsPanel(){const versionRows=[...state.versions].reverse();return `<div class="split-grid"><section class="card pad"><div class="cardhead"><div><h2>새 버전 만들기</h2><p>현재 라벨 상태를 고정합니다. 이후의 편집은 버전에 영향을 주지 않습니다.</p></div></div><form data-form="version"><div class="formgrid">${label('이름',input('name','','text',`placeholder="v${state.versions.length+1}"`))}${label('메모',input('note','','text','placeholder="무엇을 바꿨는지"'))}</div><input type="hidden" name="done_only" value="true"><p class="tiny muted"><b>보드의 완료 배치만 사용합니다.</b> 검수·라벨링 중·새로 올림은 제외됩니다.</p>${check('exclude_ambiguous','애매한 사진 제외',true)}${check('reviewed_only','사람이 검수 완료한 사진만 포함')}${check('include_background','라벨 없는 정상 배경 사진 포함',true)}<details style="margin:14px 0"><summary class="tiny muted">train에 사용할 배치 선택</summary><p class="tiny muted">선택하지 않으면 완료 배치 전체의 train 사진만 사용합니다. 선택하면 해당 완료 배치의 train만 사용하고, valid·test는 선택 여부에 따라 줄이지 않습니다.</p>${trainBatchChoices()}</details><p class="tiny muted">미배정 사진과 사람이 검수하지 않은 자동 라벨은 제외됩니다.</p><button class="btn primary">${icon('layers')}버전 만들기</button></form></section>
+function versionsPanel(){const versionRows=[...state.versions].reverse();return `<div class="split-grid"><section class="card pad"><div class="cardhead"><div><h2>새 버전 만들기</h2><p>현재 라벨 상태를 고정합니다. 이후의 편집은 버전에 영향을 주지 않습니다.</p></div></div><form data-form="version"><div class="formgrid">${label('이름',input('name','','text',`placeholder="v${state.versions.length+1}"`))}${label('메모',input('note','','text','placeholder="무엇을 바꿨는지"'))}</div><input type="hidden" name="done_only" value="true"><p class="tiny muted"><b>보드의 완료 배치만 사용합니다.</b> 검수·라벨링 중·새로 올림은 제외됩니다.</p>${check('exclude_ambiguous','애매한 사진 제외',true)}${check('reviewed_only','사람이 검수 완료한 사진만 포함')}${check('include_background','라벨 없는 정상 배경 사진 포함',true)}<details style="margin:14px 0"><summary class="tiny muted">train에 사용할 배치 선택</summary><p class="tiny muted">선택하지 않으면 완료 배치 전체의 train 사진만 사용합니다. 선택하면 해당 완료 배치의 train만 사용하고, valid·test는 선택 여부에 따라 줄이지 않습니다.</p>${trainBatchChoices()}</details><div id="version-preview" aria-live="polite"><p class="tiny muted">포함할 사진 확인 중…</p></div><button class="btn primary" id="create-version" disabled>${icon('layers')}버전 만들기</button></form></section>
  <section class="card pad"><div class="cardhead"><div><h2>자동 분할</h2><p>연속 촬영한 사진은 같은 세트에 묶습니다.</p></div>${badge('SEED 42')}</div><form data-form="split" id="split-form"><div class="formgrid three">${label('train %',input('train',70,'number','min="0" max="100" required'))}${label('valid %',input('valid',20,'number','min="0" max="100" required'))}${label('test %',input('test',10,'number','min="0" max="100" required'))}${label('대상',select('scope',[['done','완료 배치의 미배정 사진'],['unassigned','미배정 사진 전체'],['all','전체 다시 나누기']]))}${label('연속 촬영 간격 (초)',input('gap',10,'number','min="0" max="86400"'))}</div><div class="actions" style="margin-top:20px"><button class="btn" name="operation" value="preview">미리 보기</button><button class="btn primary" name="operation" value="apply" id="apply-split" disabled>분할 적용</button></div><div id="split-preview" style="margin-top:15px"></div></form><p class="tiny muted">원본 단위로 먼저 분할합니다. 기존 버전의 분할은 그대로 유지됩니다.</p></section></div>
  <div class="row between" style="margin-top:30px"><h2 style="font-size:16px">버전 목록</h2><span class="tiny muted">${num(state.versions.length)}개 버전</span></div>${versionRows.length?versionRows.map((v,i)=>`<article class="card versioncard"><div class="row between"><div class="row"><h3>${esc(v.name)}</h3>${i===0?badge('최신','blue'):''}<span class="tiny muted">${date(v.created)}</span></div><span class="smalltext">총 ${num(Object.values(v.counts).reduce((a,b)=>a+b,0))}장</span></div>${v.note?`<p>${esc(v.note)}</p>`:''}${versionBatchUsage(v)}<div class="splitnums">${['train','valid','test'].map(k=>`<div><small>${k}</small><b class="metric">${num(v.counts[k])}</b></div>`).join('')}</div><div class="actions"><a class="btn small" href="/api/versions/${v.id}/export?format=coco">${icon('download','small')}COCO 라벨</a><a class="btn small" href="/api/versions/${v.id}/export?format=yolo">YOLO 세그먼트 라벨</a><a class="btn small" href="/api/versions/${v.id}/export?format=coco&images=1">사진 포함 ZIP</a>${versionRows[i+1]?`<button class="btn small" data-action="compare-version" data-id="${v.id}" data-with="${versionRows[i+1].id}">${esc(versionRows[i+1].name)}와 비교</button>`:''}</div></article>`).join(''):empty('아직 버전이 없습니다','사진을 분할한 뒤 첫 버전을 만들어 보세요.')}`;}
 function trainingForm(){return `<section class="card pad" id="training-form" style="margin-bottom:22px"><div class="cardhead"><h2>새 학습</h2>${badge('RTMDet-Ins · MMDetection','blue')}</div><form data-form="training"><fieldset class="formsection"><legend><span>1</span>학습 방식 · 데이터</legend><div class="formgrid">${label('학습 방식',select('start_mode',[['finetune','기존 모델에서 추가 학습 · 빠름'],['scratch','새 모델을 처음부터 학습']],activeModels().length?'finetune':'scratch'))}${label('데이터셋 버전',select('version_id',[['','버전 선택'],...options([...state.versions].reverse())]),false)}</div><div data-existing-model hidden style="margin-top:14px">${label('추가 학습할 내 모델',select('resume_model',[['','모델을 선택하세요'],...activeModels().map(m=>{const score=m.evaluations?.[m.version_id]?.metrics?.['coco/segm_mAP_50']??m.metrics?.best_mask_mAP50;return [m.id,m.name+' · '+(state.versions.find(v=>v.id===m.version_id)?.name||m.version_name||'외부 모델')+' · valid mAP50 '+(typeof score==='number'?score.toFixed(3):'평가 전')];})],'','disabled'))}<p class="tiny muted">앞쪽 특징층은 유지하고 뒤쪽 층과 마스크를 추가 학습합니다. 기존 정상·결함도 포함한 버전을 선택하세요.</p></div></fieldset><fieldset class="formsection"><legend><span>2</span>모델</legend><div class="formgrid three">${label('모델 종류','<input value="RTMDet-Ins · 마스크" readonly aria-label="모델 종류">')}${label('모델 크기',select('size',[['s','S · 빠름'],['m','M'],['l','L · 기본'],['x','X · 가장 큼']],'l'))}${label('입력 크기',select('input_size',[['640x1536','640 × 1536'],['704x1472','704 × 1472'],['1024x1024','1024 × 1024'],['768x768','768 × 768']]))}</div></fieldset><fieldset class="formsection"><legend><span>3</span>학습 설정</legend><div class="formgrid three">${label('최대 epoch',input('epochs',activeModels().length?20:40,'number','min="1" max="1000" required'))}${label('조기 종료 · 개선 없는 epoch',input('patience',10,'number','min="1" max="200" required'))}${label('배치 크기',input('batch_size',4,'number','min="1" max="64" required'))}${label('학습률',input('lr',.0002,'number','step="any" min="0.000001" max="1" required'))}${label('이름 · 비우면 자동',input('name','','text','placeholder="예: rtmins_v1_l"'))}</div></fieldset><div class="row between"><p class="tiny muted">AMP 학습 · 5 epoch마다 전체 valid 검증 · 마지막 epoch 검증 · 마스크 mAP50 기준 저장</p><button class="btn primary" ${!state.connection.ml.ready||!state.versions.length?'disabled':''}>${icon('train')}학습 시작</button></div></form></section>`;}
@@ -204,7 +238,8 @@ function comparisonChart(){
  const vals=metrics.map(([key])=>m.evaluations[ver].metrics[key]);
  return vals.map((v,j)=>valid(v)?`${j>0&&valid(vals[j-1])?`<line x1="${130+(j-1)*240}" y1="${260-vals[j-1]*220}" x2="${130+j*240}" y2="${260-v*220}" stroke="${colors[i%colors.length]}" stroke-width="2.5"/>`:''}<circle cx="${130+j*240}" cy="${260-v*220}" r="${v===best[j]?8:5}" stroke="${v===best[j]?'#d69b1f':'none'}" stroke-width="3" fill="${colors[i%colors.length]}"><title>${esc(m.name)} · ${metrics[j][1]} ${(v*100).toFixed(1)}점</title></circle>`:'').join('');
  }).join('')}</svg><div class="tablewrap"><table class="table"><thead><tr><th>선택한 모델</th>${metrics.map(([,label])=>`<th>${label}</th>`).join('')}</tr></thead><tbody>${models.map((m,i)=>`<tr><td style="color:${colors[i%colors.length]}">${esc(m.name)}</td>${metrics.map(([key],j)=>{const v=m.evaluations[ver].metrics[key],win=valid(v)&&v===best[j];return `<td ${win?'class="metric-best" data-best-metric="'+key+'"':''}>${valid(v)?(v*100).toFixed(1):'자료 없음'}${win?' <span class="best-tag">최고</span>':''}</td>`;}).join('')}</tr>`).join('')}</tbody></table></div>`:'';
- return `<div class="comparison-chart" role="region" aria-label="선택 모델 평가 그래프">${waiting}${chart}<p class="tiny muted">가로축은 평가 지표, 세로축은 0–100점(mAP × 100)입니다. 높을수록 좋으며 실제 결함 탐지율(%)과는 다른 지표입니다.</p></div>`;
+ const scopes=models.map(m=>{const s=m.evaluations[ver].evaluation_scope,excluded=s?.omitted_unlabelled_normal_classes||[];return excluded.length?`<p class="tiny muted">${esc(m.name)}: valid 정답이 없는 추가 정상 클래스 ${esc(excluded.join(', '))} 제외 · 기존 클래스 순서로 평가</p>`:'';}).join('');
+ return `<div class="comparison-chart" role="region" aria-label="선택 모델 평가 그래프">${waiting}${chart}${scopes}<p class="tiny muted">가로축은 평가 지표, 세로축은 0–100점(mAP × 100)입니다. 높을수록 좋으며 실제 결함 탐지율(%)과는 다른 지표입니다. valid 정답이 없는 클래스는 mAP 평균에서 제외됩니다.</p></div>`;
 }
 function modelTable(compare=false){
  if(!activeModels().length)return empty('등록된 RTMDet-Ins 모델이 없습니다','학습을 완료하거나 기존 체크포인트를 등록하세요.');
@@ -260,19 +295,21 @@ function settingsPage(){return head('설정','작업 공간과 데이터 연결 
 async function renderPage(){
  imageListObserver?.disconnect();imageListObserver=null;
  const token=++renderToken;rememberTrainingForm();rememberUploadForm();await closeEditor();document.querySelector('#main').className='';
+ const mainNode=document.querySelector('#main');
+ if(workspaceMode==='efficientad'){header();mainNode.innerHTML=efficientADPage();disposeEfficientAD=await mountEfficientAD(mainNode,{api,toast,modal});return;}
  const [r,q]=(location.hash.slice(2)||'').split('?');route=r;params=new URLSearchParams(q||'');header();
  const main=document.querySelector('#main');
  if(route==='classes'){location.replace('#/settings?section=classes');return;}
  if(route==='upload'||route==='versions'){location.replace(route==='upload'?'#/board?upload=1':'#/train');return;}
- if(route.startsWith('annotate/')){const image=state.images.find(x=>x.id===route.split('/')[1]);if(image){main.className='editor-main';openEditor(image,state,refresh);rememberLastEditor(image);return;}main.innerHTML=empty('사진을 찾을 수 없습니다');return;}
+ if(route.startsWith('annotate/')){const id=route.split('/')[1];let image=state.images.find(x=>x.id===id);if(image){if(image._summary){image=await api('/api/images/'+id);if(token!==renderToken)return;state.images[state.images.findIndex(x=>x.id===id)]=image;}main.className='editor-main';openEditor(image,state,refresh);rememberLastEditor(image);return;}main.innerHTML=empty('사진을 찾을 수 없습니다');return;}
  const pages={'':dashboard,board:boardPage,images:()=>imagesPage(false),trash:()=>params.get('type')==='models'?trashedModelsPage():imagesPage(true),train:trainingWorkspacePage,models:modelsPage,test:()=>'',settings:settingsPage};
  main.innerHTML=(pages[route]||(()=>head('페이지를 찾을 수 없습니다','상단 메뉴에서 작업을 선택하세요.')))();
- if(route==='test'){location.assign('http://127.0.0.1:8899/');return;}
- if(route==='train'){const model=params.get('model'),ver=comparisonVersion();if(model&&activeModels().some(m=>m.id===model)){const ids=comparedModels.get(ver)||new Set();ids.add(model);comparedModels.set(ver,ids);saveComparisonSelections();main.querySelector('#model-comparison').innerHTML=comparisonChart();const box=main.querySelector(`[data-compare-model="${model}"]`);if(box)box.checked=true;}splitPreview=null;restoreTrainingForm();}
+ if(route==='test'){main.innerHTML=inspectionPage(activeModels());mountInspection({baseUrl:location.pathname.startsWith('/cable/')?location.origin+'/cable/test':'http://127.0.0.1:8899'});return;}
+ if(route==='train'){const model=params.get('model'),ver=comparisonVersion();if(model&&activeModels().some(m=>m.id===model)){const ids=comparedModels.get(ver)||new Set();ids.add(model);comparedModels.set(ver,ids);saveComparisonSelections();main.querySelector('#model-comparison').innerHTML=comparisonChart();const box=main.querySelector(`[data-compare-model="${model}"]`);if(box)box.checked=true;}splitPreview=null;restoreTrainingForm();await syncVersionPreview();}
  if(route==='settings'&&params.get('section')==='classes')document.querySelector('#class-settings')?.scrollIntoView({block:'start'});
  if(route==='board'){setupUpload();if(params.get('upload')==='1')document.querySelector('#upload-meta [name=batch]').focus({preventScroll:true});}
  if(token!==renderToken)return;
- if(route==='images'||route==='trash')observeImageList();
+ if(route==='images'||route==='trash'){observeImageList();loadImagePreviews().catch(e=>toast(e.message,true));}
 }
 
 async function bulk(changes){await api('/api/images/bulk',{ids:[...selected],changes});selected.clear();await refresh();toast('저장했습니다');}
@@ -291,6 +328,7 @@ async function actions(action,el){
   case 'restore':await bulk({deleted:false});break;
   case 'image-trash':case 'image-restore':{await api('/api/images/bulk',{ids:[id],changes:{deleted:action==='image-trash'}});selected.delete(id);await refresh();toast(action==='image-trash'?'사진을 휴지통으로 옮겼습니다':'사진을 복원했습니다');break;}
   case 'model-trash':case 'model-restore':{await api('/api/models/'+id,{deleted:action==='model-trash'});closeModal();await refresh();toast(action==='model-trash'?'모델을 휴지통으로 옮겼습니다':'모델을 복원했습니다. 사용하려면 모델 목록에서 다시 선택하세요.');break;}
+  case 'restore-board':modal('보드로 복원',`<form data-form="restore-board"><div class="formgrid">${label('복원할 보드',select('batch',[['','새 보드 만들기'],...options(state.batches)]))}${label('새 보드 이름',input('name','','text','maxlength="200"'))}</div><p class="tiny muted">선택한 ${selected.size}장을 휴지통에서 꺼내 해당 보드로 옮깁니다. 기존 보드를 고르면 새 보드 이름은 무시합니다.</p><button class="btn primary">복원</button></form>`);break;
   case 'bulk-tags':modal('태그 추가',`<form data-form="bulk-tags">${label('태그 · 쉼표로 구분',input('tags','','text','required'))}<p class="tiny muted">${selected.size}장의 기존 태그에 추가합니다.</p><button class="btn primary">적용</button></form>`);break;
   case 'bulk-predict':predictionForm([...selected]);break;
   case 'new-batch':modal('새 배치',`<form data-form="batch">${label('배치 이름',input('name','','text','required'))}<button class="btn primary" style="margin-top:20px">만들기</button></form>`);break;
@@ -338,6 +376,7 @@ document.addEventListener('change',async event=>{
   else if(el.dataset.stageSelect){await api('/api/batches',{id:el.dataset.stageSelect,stage:el.value});await refresh();}
   else if(el.name==='active-model'){await api('/api/models/'+el.value,{active:true});await refresh();toast('사용할 모델을 변경했습니다');}
   else if(el.name==='start_mode'||el.name==='resume_model'){syncTrainingMode();rememberTrainingForm();}
+  else if(el.closest('[data-form=version]')&&el.type==='checkbox')await syncVersionPreview();
   else if(el.closest('[data-form=evaluate]')&&el.name==='version_id')updateEvaluationSummary();
   else if(el.name==='compare-version')setQuery({version:el.value});
   else if(el.matches('[data-compare-model]')){const ver=comparisonVersion(),ids=comparedModels.get(ver)||new Set();el.checked?ids.add(el.dataset.compareModel):ids.delete(el.dataset.compareModel);comparedModels.set(ver,ids);saveComparisonSelections();document.querySelector('#model-comparison').innerHTML=comparisonChart();}
@@ -356,7 +395,7 @@ document.addEventListener('submit',async event=>{
   else if(kind==='class'){if(data.shortcut&&Object.values(resolvedShortcuts(state.settings)).includes(data.shortcut.toUpperCase()))throw Error('편집기에서 사용 중인 단축키입니다. 다른 키를 선택하세요.');data.normal=fd.has('normal');if(!data.id)delete data.id;await api('/api/classes',data);}
   else if(kind==='batch'){if(!data.id)delete data.id;await api('/api/batches',data);if(!data.id){params.set('empty','1');location.hash='#/board?empty=1';}}
   else if(kind==='merge'){data.sources=fd.getAll('sources');await api('/api/batches/merge',data);}
-  else if(kind==='version'){for(const key of ['done_only','exclude_ambiguous','reviewed_only','include_background'])data[key]=fd.has(key);data.train_batches=fd.getAll('train_batches');const version=await api('/api/versions',data);pendingTrainingVersion=version.id;}
+  else if(kind==='version'){const version=await api('/api/versions',versionSelectionBody(form));pendingTrainingVersion=version.id;}
   else if(kind==='split'){
    const apply=submit?.value==='apply';if(apply&&!splitPreview)throw Error('먼저 분할을 미리 보세요');
    if(apply)data.fingerprint=splitPreview.fingerprint;
@@ -371,6 +410,7 @@ document.addEventListener('submit',async event=>{
   else if(kind==='evaluate'){await api('/api/jobs',{mode:'eval',...data});const ids=comparedModels.get(data.version_id)||new Set();ids.add(data.model_id);comparedModels.set(data.version_id,ids);saveComparisonSelections();location.hash='#/train?version='+encodeURIComponent(data.version_id);}
   else if(kind==='accept-predictions'){data.append=fd.has('append');await api('/api/predictions/accept',data);}
   else if(kind==='settings')await api('/api/settings',data);
+  else if(kind==='restore-board'){let batch=data.batch;if(!batch){const name=data.name.trim();if(!name)throw Error('새 보드 이름을 입력하세요');batch=(await api('/api/batches',{name,stage:'new'})).id;}await api('/api/images/bulk',{ids:[...selected],changes:{deleted:false,batch}});selected.clear();}
   else if(kind==='bulk-tags'){const tags=data.tags.split(',').map(x=>x.trim()).filter(Boolean);for(const id of selected){const x=state.images.find(x=>x.id===id);await api('/api/images/'+id,{revision:x.revision,tags:[...new Set([...x.tags,...tags])]});}selected.clear();}
   else return;
   closeModal();await refresh();toast('저장했습니다');
@@ -419,8 +459,23 @@ async function uploadFiles(files){
 window.addEventListener('hashchange',async()=>{closeModal();selected.clear();try{await renderPage();window.scrollTo(0,0);}catch(e){toast(e.message,true);}});
 document.querySelector('#modal').addEventListener('click',e=>{if(e.target===e.currentTarget){const r=e.currentTarget.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)closeModal();}});
 try{document.documentElement.dataset.theme=localStorage.getItem('studio-theme')||'light';await refresh();}catch(e){document.querySelector('#main').innerHTML=empty('작업 공간에 연결할 수 없습니다',e.message);}
-setInterval(async()=>{if(document.hidden||!state?.jobs.some(j=>['running','queued'].includes(j.status)))return;try{const fresh=await api('/api/state');state=fresh;await syncValidationProgress();header();syncJobCenter();if(['train','models'].includes(route)&&!document.querySelector('#modal').open&&!document.querySelector('#main').contains(document.activeElement))await renderPage();}catch{}},4000);
+setInterval(async()=>{if(document.hidden||!state?.jobs.some(j=>['running','queued'].includes(j.status)))return;try{const fresh=await api('/api/activity');state={...state,...fresh};await syncValidationProgress();header();syncJobCenter();if(workspaceMode==='rtmdet'&&['train','models'].includes(route)&&!document.querySelector('#modal').open&&!document.querySelector('#main').contains(document.activeElement))await renderPage();}catch{}},4000);
 
 refreshGPU();setInterval(refreshGPU,5000);
 
 document.addEventListener('keydown',event=>{if(!event.target.matches?.('[data-shortcut-key]')||event.key==='Tab')return;event.preventDefault();event.stopPropagation();if(event.key==='Backspace'&&!event.ctrlKey&&!event.altKey&&!event.shiftKey){event.target.value='';return;}const key=eventShortcut(event);if(key)event.target.value=key;});
+
+async function switchWorkspace(mode){
+ if(switchingWorkspace||mode===workspaceMode)return;
+ switchingWorkspace=true;const main=document.querySelector('#main'),reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches,direction=mode==='efficientad'?1:-1;
+ try{rememberTrainingForm();rememberUploadForm();await closeEditor();
+  document.querySelectorAll('[data-workspace]').forEach(b=>b.disabled=true);
+  if(mode==='efficientad')await prepareEfficientAD(api);
+  if(!reduced)await main.animate([{opacity:1,transform:'translateX(0)'},{opacity:0,transform:`translateX(${-direction*28}px)`}],{duration:160,easing:'ease-in',fill:'forwards'}).finished;
+  if(disposeEfficientAD){disposeEfficientAD();disposeEfficientAD=null;}
+  workspaceMode=mode;localStorage.setItem('studio-model-workspace',mode);main.onclick=null;await renderPage();window.scrollTo(0,0);
+  main.getAnimations().forEach(a=>a.cancel());
+  if(!reduced)await main.animate([{opacity:0,transform:`translateX(${direction*28}px)`},{opacity:1,transform:'translateX(0)'}],{duration:280,easing:'cubic-bezier(.16,1,.3,1)'}).finished;
+ }catch(e){main.getAnimations().forEach(a=>a.cancel());toast(e.message,true);}finally{switchingWorkspace=false;document.querySelectorAll('[data-workspace]').forEach(b=>b.disabled=false);}
+}
+document.addEventListener('click',e=>{const button=e.target.closest('[data-workspace]');if(button)switchWorkspace(button.dataset.workspace);});

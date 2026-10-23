@@ -36,8 +36,13 @@ class Studio:
     def event(self, action, detail=''):
         self.store.put('events', dict(id=uid(), action=action, detail=detail, created=now()))
 
-    def state(self):
+    def state(self, compact=False):
         result = {k:self.store.all(k) for k in ('images','batches','classes','models','jobs')}
+        if compact:
+            fields=('id','name','file','width','height','batch','sensor','split','tags','note','status','deleted','revision','created','updated','shot_time')
+            result['images']=[dict({k:x[k] for k in fields if k in x},
+                annotations=[dict(class_id=a['class_id']) for a in x.get('annotations',[])],
+                _summary=True) for x in result['images']]
         result['versions'] = self.store.summaries('versions', ('images','classes'))
         result['events'] = self.store.all('events')[-40:][::-1]
         result['settings'] = {x['id']:x.get('value') for x in self.store.all('settings')}
@@ -264,28 +269,44 @@ class Studio:
             self.store.put_many('images',[x for x,_ in assignment]); self.event('자동 분할',str(dict(counts)))
         return dict(counts={k:counts[k] for k in ('train','valid','test')},groups=len(groups),total=len(images),fingerprint=fingerprint,applied=apply)
 
-    def create_version(self, body):
+    def version_selection(self, body):
+        """One selection policy for preview and commit; never silently drop pending data."""
         batches={b['id']:b for b in self.store.all('batches')}
         selected=body.get('train_batches') or []
         if not isinstance(selected,list) or any(not isinstance(k,str) or k not in batches or batches[k]['stage']!='done' for k in selected):
             raise ValueError('train에는 완료 배치만 선택할 수 있습니다. 보드를 확인하고 새로고침하세요.')
-        images=[]
+        images=[];pending=[];excluded=Counter();pending_batches=Counter()
         for x in self.store.all('images'):
-            if x['deleted'] or not x['split']: continue
-            if batches.get(x['batch'],{}).get('stage')!='done': continue
-            if body.get('exclude_ambiguous',True) and x['status']=='ambiguous': continue
-            if body.get('reviewed_only') and x['status']!='reviewed': continue
-            if x['status'] in ('auto','ai_reviewed'): continue
-            if not body.get('include_background',True) and not x['annotations']: continue
-            if selected and x['split']=='train' and x['batch'] not in selected: continue
+            if x['deleted']:excluded['deleted']+=1;continue
+            if batches.get(x['batch'],{}).get('stage')!='done':excluded['not_done']+=1;continue
+            if body.get('exclude_ambiguous',True) and x['status']=='ambiguous':excluded['ambiguous']+=1;continue
+            if body.get('reviewed_only') and x['status']!='reviewed':excluded['not_reviewed']+=1;continue
+            if x['status'] in ('auto','ai_reviewed'):excluded['automatic_label']+=1;continue
+            if not body.get('include_background',True) and not x['annotations']:excluded['background']+=1;continue
+            if selected and x['split'] in ('','train') and x['batch'] not in selected:excluded['unselected_batch']+=1;continue
+            if not x['split']:
+                pending.append(x);pending_batches[x['batch']]+=1;continue
             images.append(x)
+        report=dict(counts={k:sum(x['split']==k for x in images) for k in ('train','valid','test')},
+                    pending_count=len(pending),pending_batches=[dict(id=k,name=batches[k]['name'],count=n) for k,n in pending_batches.items()],
+                    excluded=dict(excluded))
+        return images,batches,selected,report
+
+    def preview_version(self, body):
+        return self.version_selection(body)[3]
+
+    def create_version(self, body):
+        images,batches,selected,report=self.version_selection(body)
+        if report['pending_count']:
+            names=', '.join(b['name']+' '+str(b['count'])+'장' for b in report['pending_batches'])
+            raise ValueError('완료 배치에 미분할 사진 '+str(report['pending_count'])+'장이 있습니다 ('+names+'). 자동 분할의 미리 보기 → 분할 적용 후 버전을 만드세요. 새 사진을 제외한 버전은 만들지 않았습니다.')
         if not images: raise ValueError('조건에 맞는 분할된 사진이 없습니다')
         versions=self.store.all('versions')
         name=str(body.get('name','')).strip() or f'v{len(versions)+1}'
         if any(v['name']==name for v in versions): raise ValueError('이미 있는 버전 이름입니다')
         rules={**body,'done_only':True,'train_batches':selected,'resolved_train_batches':sorted({x['batch'] for x in images if x['split']=='train'})}
         snapshot=[dict(id=k,name=batches[k]['name'],stage='done',counts=dict(Counter(x['split'] for x in images if x['batch']==k))) for k in sorted({x['batch'] for x in images})]
-        version=dict(id=uid(),name=name[:100],note=str(body.get('note',''))[:1000],created=now(),images=images,classes=self.store.all('classes'),rules=rules,batch_snapshot=snapshot,counts=dict(Counter(x['split'] for x in images)))
+        version=dict(id=uid(),name=name[:100],note=str(body.get('note',''))[:1000],created=now(),images=images,classes=self.store.all('classes'),rules=rules,batch_snapshot=snapshot,counts=dict(Counter(x['split'] for x in images)),selection_audit=report)
         self.store.put('versions',version); self.event('버전 고정',version['name'])
         return version
 

@@ -1,5 +1,6 @@
 """Local dxel Studio rebuild. Python standard library only."""
 import argparse
+import gzip
 import io
 import json
 import mimetypes
@@ -13,6 +14,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from services import Studio, now, uid
 from store import Store
 from ml import ML
+from efficientad import EfficientAD
 
 ROOT=Path(__file__).resolve().parent
 
@@ -23,6 +25,7 @@ def create_server(data, port=8898, demo=False):
     studio=Studio(store,data)
     if demo: studio.demo()
     ml=ML(studio)
+    efficientad=EfficientAD(ml)
     mutation_lock=threading.RLock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -31,14 +34,17 @@ def create_server(data, port=8898, demo=False):
             pass
 
         def send(self,content,status=200,ctype='application/json; charset=utf-8',filename=None):
-            if not isinstance(content,bytes): content=json.dumps(content,ensure_ascii=False,allow_nan=False).encode('utf-8')
+            if not isinstance(content,bytes): content=json.dumps(content,ensure_ascii=False,allow_nan=False,separators=(',',':')).encode('utf-8')
+            compressed=len(content)>1024 and 'gzip' in self.headers.get('Accept-Encoding','') and any(x in ctype for x in ('json','javascript','html','css'))
+            if compressed:content=gzip.compress(content,compresslevel=3)
             self.send_response(status)
             self.send_header('Content-Type',ctype)
             self.send_header('Content-Length',str(len(content)))
+            if compressed:self.send_header('Content-Encoding','gzip');self.send_header('Vary','Accept-Encoding')
             self.send_header('X-Content-Type-Options','nosniff')
             self.send_header('Referrer-Policy','no-referrer')
             self.send_header('Cache-Control','no-store')
-            self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'")
+            self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors "+("'self'" if self.path.startswith('/efficientad-test/') else "'none'"))
             if filename:
                 from urllib.parse import quote
                 self.send_header('Content-Disposition',"attachment; filename*=UTF-8''"+quote(filename))
@@ -76,12 +82,26 @@ def create_server(data, port=8898, demo=False):
                 self.send(dict(error='처리에 실패했습니다. 서버 설정을 확인하세요.'),500)
 
         def get(self,path,q):
-            if path=='/api/state':
-                ml.refresh(); state=studio.state()
+            if path.startswith('/efficientad-test/'):
+                status,mime,raw=efficientad.inspection(path);self.send(raw,status,ctype=mime)
+            elif path=='/api/efficientad':
+                self.send(efficientad.request(dict(action='state')))
+            elif path=='/api/state':
+                ml.start_auto_connection();ml.refresh(); state=studio.state(compact=q.get('compact')==['1'])
                 state['versions']=[{k:v for k,v in x.items() if k not in ('images','classes')} for x in state['versions']]
                 state['jobs']=[{k:v for k,v in x.items() if k!='spec'} for x in state['jobs']]
                 state['connection']=dict(database='샘플 DB' if demo else '로컬 SQLite',demo=demo,ml=ml.info,mode='local',schema_version=1)
                 self.send(state)
+            elif path=='/api/activity':
+                ml.refresh()
+                self.send(dict(jobs=[{k:v for k,v in x.items() if k!='spec'} for x in store.all('jobs')],
+                    models=store.all('models'),versions=store.summaries('versions',('images','classes'))))
+            elif path=='/api/image-previews':
+                ids=q.get('ids',[''])[0].split(',')
+                if not 1<=len(ids)<=100:raise ValueError('한 번에 최대 100장입니다')
+                self.send([dict(id=x['id'],revision=x['revision'],annotations=[dict(class_id=a['class_id'],points=a['points']) for a in x.get('annotations',[])]) for x in (store.get('images',key) for key in ids)])
+            elif path.startswith('/api/images/'):
+                self.send(store.get('images',path.split('/')[3]))
             elif path=='/api/gpu': self.send(ml.gpu_info())
             elif path=='/api/backup': self.send(store.backup(),filename='studio-backup.json')
             elif path.startswith('/api/versions/'):
@@ -127,7 +147,10 @@ def create_server(data, port=8898, demo=False):
                 self.send(p.read_bytes(),ctype=mimetypes.guess_type(p)[0] or 'application/octet-stream')
 
         def post(self,path,body):
-            if path=='/api/ml/connect': result=ml.connect_remote(body)
+            if path=='/efficientad-test/api/inspect':
+                status,mime,raw=efficientad.inspection(path,body,self.headers.get('X-GUI-Token',''));self.send(raw,status,ctype=mime);return
+            elif path=='/api/efficientad': result=efficientad.request(body)
+            elif path=='/api/ml/connect': result=ml.connect_remote(body)
             elif path=='/api/images/bulk': result=studio.bulk(body)
             elif path.startswith('/api/images/'): result=studio.update_image(path.split('/')[3],body)
             elif path=='/api/batches': result=studio.save_batch(body)
@@ -135,6 +158,7 @@ def create_server(data, port=8898, demo=False):
             elif path=='/api/classes': result=studio.save_class(body)
             elif path=='/api/split/preview': result=studio.split(body)
             elif path=='/api/split/apply': result=studio.split(body,apply=True)
+            elif path=='/api/versions/preview': result=studio.preview_version(body)
             elif path=='/api/versions': result=studio.create_version(body)
             elif path=='/api/jobs': result=ml.launch(body)
             elif path.startswith('/api/jobs/') and path.endswith('/resume-fast'): result=ml.resume_training(path.split('/')[3])

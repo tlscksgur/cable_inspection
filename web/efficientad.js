@@ -1,0 +1,62 @@
+/* EfficientAD management view, sharing the Studio shell and SSH session. */
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num=n=>Number(n||0).toLocaleString('ko-KR');
+let prefetched=false;
+export async function prepareEfficientAD(api){snapshot=await api('/api/efficientad');prefetched=true;}
+let snapshot=null,draft={kind:'dense',steps:24},tab='test',generation=0;
+const kinds={dense:'WaterDense · 위치 학습',mil:'특징 기반 판별',efficientad:'EfficientAD · 정상 학습'};
+const labels={surfaceROI_waterDenseRegions_20261007:'WaterDense · 기존 모델',surfaceROI_waterDense_ilin172_20261014_candidate:'WaterDense · 172장 보강'};
+const title=m=>m.name!==m.id?m.name:(labels[m.id]||m.name);
+function metrics(m){
+ const valid=v=>Object.values(v).every(x=>typeof x==='number'&&Number.isFinite(x));
+ for(const [file,s] of Object.entries(m.metrics||{}).filter(([k])=>k.includes('summary'))){
+  if(s.by_role?.test){const v=s.by_role.test.after||s.by_role.test,r={n:v.normal,fp:v.false_positive,a:v.defects,tp:v.detected};if(valid(r))return r;}
+  const r={n:s.normal_images,fp:s.false_positive_images,a:s.anomaly_images,tp:s.detected_anomaly_images};if(valid(r))return r;
+ }return null;
+}
+export function efficientADPage(){tab='test';return `<div class="ea-workspace"><div class="pagehead"><div><div class="eyebrow">EFFICIENTAD WORKSPACE</div><h1>EfficientAD</h1><p>이미지를 검사하고, 학습과 모델 관리를 이어서 진행하세요.</p></div><button class="btn" data-ea="refresh">새로고침</button></div><nav class="ea-tabs" aria-label="EfficientAD 작업"><button data-ea-tab="test">모델 테스트</button><button data-ea-tab="train">학습</button><button data-ea-tab="data">데이터셋</button><button data-ea-tab="models">모델 관리</button></nav><div id="ea-content"><div class="card pad muted">서버 자료를 불러오는 중…</div></div></div>`;}
+function remember(root){const f=root.querySelector('#ea-train');if(f)draft=Object.fromEntries(new FormData(f));}
+function training(s){
+ const isDense=draft.kind==='dense',available=s.models.filter(m=>isDense?m.dense_trainable:m.trainable),data=s.datasets.filter(d=>d.kind===(isDense?'dense':'efficientad'));
+ if(isDense&&!available.some(m=>m.id===draft.base))draft.base=available.find(m=>m.id==='surfaceROI_waterDenseRegions_20261007')?.id||available[0]?.id||'';
+ if(!data.some(d=>d.id===draft.dataset))draft.dataset=data.find(d=>d.id===draft.base)?.id||'';
+ return `<div class="ea-train-layout"><section class="card pad"><div class="cardhead"><div><h2>새 학습</h2><p>${isDense?'기존 특징과 가중치를 재사용해 물방울·시리얼과 결함 위치를 학습합니다.':'정상 원본으로 학습하고, 별도 정상 calibration으로 기준을 계산합니다.'}</p></div><span class="badge green">${isDense?'WaterDense':'EfficientAD-S'}</span></div><form id="ea-train"><label class="field">학습 방식<select name="kind"><option value="dense" ${isDense?'selected':''}>WaterDense · 위치 판별기 추가 학습</option><option value="efficientad" ${!isDense?'selected':''}>EfficientAD-S · 정상 이미지 학습</option></select></label><label class="field">학습 이름<input name="name" required pattern="[a-zA-Z0-9_-]{1,110}" placeholder="예: surface_20261019" value="${esc(draft.name||'')}" maxlength="110"></label><label class="field">고정 데이터셋<select name="dataset" required><option value="">데이터셋 선택</option>${data.map(d=>`<option value="${esc(d.id)}" ${draft.dataset===d.id?'selected':''}>${esc(d.id)}</option>`).join('')}</select></label><div id="ea-dataset-counts" class="ea-dataset-counts"></div><label class="field">시작 모델<select name="base" ${isDense?'required':''}>${isDense?'':'<option value="">새 EfficientAD 모델 학습</option>'}${available.map(m=>`<option value="${esc(m.id)}" ${draft.base===m.id?'selected':''}>${esc(title(m))}</option>`).join('')}</select></label><div class="formgrid"><label class="field">${isDense?'최대 epoch':'학습 step'}<input name="steps" type="number" min="${isDense?1:100}" max="${isDense?200:200000}" step="${isDense?1:100}" value="${esc(draft.steps||(isDense?24:10000))}" required></label><div class="field">${isDense?'학습 대상':'입력 · 배치'}<div class="ea-setting-value">${isDense?'특징 고정 · 위치 판별기':'512 × 512 px · 배치 1'}</div></div></div><p class="tiny muted">${isDense?'물방울·시리얼은 정상, 실제 결함 위치는 결함으로 학습합니다. calibration은 정상 원본만 사용하며, 테스트는 모델 선택에 사용하지 않습니다.':'기존 train·calibration·test 분할을 그대로 사용합니다. 입력은 원본별 512px 타일이며 배치 크기는 1입니다.'}</p><div class="row between"><span class="tiny muted">완료 후 정상 오탐 / 결함 탐지를 각각 저장</span><button class="btn primary" type="submit" ${s.jobs.some(j=>['running','queued'].includes(j.status))?'disabled':''}>학습 시작</button></div></form></section><section class="card pad"><div class="cardhead"><h2>학습 진행</h2><span class="tiny muted">자동 갱신</span></div><div id="ea-jobs">${jobs(s.jobs)}</div></section></div>`;
+}
+function jobs(items){return items.length?items.map(j=>{const progress=Math.min(100,100*(j.step||0)/Math.max(1,j.total||1));return `<article class="ea-job"><div class="row between"><strong>${esc(j.name||j.id)}</strong><span class="badge ${j.status==='completed'?'green':j.status==='failed'?'amber':'blue'}">${{queued:'준비',running:'진행 중',completed:'완료',failed:'실패',cancelled:'중단'}[j.status]||esc(j.status)}</span></div><p class="smalltext muted">${esc(j.error||j.stage)}</p>${['running','queued'].includes(j.status)?`<div class="ea-progress"><span style="width:${progress}%"></span></div><p class="tiny muted">${num(j.step)} / ${num(j.total)} ${j.unit||'step'} · ${progress.toFixed(1)}%</p>`:''}<button class="btn small" data-ea="log" data-id="${esc(j.id)}">로그 보기</button>${['running','queued'].includes(j.status)?`<button class="btn small danger" data-ea="cancel" data-id="${esc(j.id)}">학습 중단</button>`:''}</article>`;}).join(''):'<div class="ea-empty"><span>학습 준비 완료</span><p>데이터셋과 시작 모델을 선택해<br>새 실험을 만들어 보세요.</p></div>';}
+function datasets(s){return `<section class="card pad"><div class="cardhead"><div><h2>기존 고정 데이터셋</h2><p>원본 단위로 나눈 기존 분할입니다. 학습할 때 다시 섞지 않습니다.</p></div></div><div class="tablewrap"><table class="table"><thead><tr><th>데이터셋</th><th>방식</th><th>학습 원본</th><th>정상 calibration</th><th>테스트 원본</th><th>학습 타일</th><th></th></tr></thead><tbody>${s.datasets.map(d=>`<tr><td class="ea-model-name">${esc(d.id)}</td><td>${d.kind==='dense'?'위치 학습':'정상 학습'}</td><td>${num(d.counts.train)}</td><td>${num(d.counts.calibration)}</td><td>${num(d.counts.test)}</td><td>${d.tiles.train===undefined?'캐시 특징':num(d.tiles.train)}</td><td><button class="btn small" data-ea="use-dataset" data-id="${esc(d.id)}">학습에 사용</button></td></tr>`).join('')}</tbody></table></div></section>`;}
+function models(s){return `<section class="card pad"><div class="cardhead"><div><h2>보관 모델 <span class="muted">${s.models.length}</span></h2><p>결과는 각 모델에 저장된 테스트 기준입니다. 데이터가 다른 결과를 직접 비교하지 마세요.</p></div></div><div class="tablewrap"><table class="table"><thead><tr><th>모델</th><th>학습 방식</th><th>정상 오탐</th><th>결함 탐지</th><th></th></tr></thead><tbody>${s.models.map(m=>{const v=metrics(m);return `<tr><td class="ea-model-name"><strong>${esc(title(m))}</strong><small>${esc(m.id)}</small></td><td><span class="badge ${m.kind==='dense'?'blue':''}">${kinds[m.kind]}</span></td><td>${v?`${num(v.fp)} / ${num(v.n)}장`:'—'}</td><td>${v?`${num(v.tp)} / ${num(v.a)}장`:'—'}</td><td><div class="row"><button class="btn small" data-ea="detail" data-id="${esc(m.id)}">상세</button><button class="btn small" data-ea="rename" data-id="${esc(m.id)}">이름 변경</button>${m.trainable||m.dense_trainable?`<button class="btn small" data-ea="use-model" data-id="${esc(m.id)}">추가 학습</button>`:''}</div></td></tr>`;}).join('')}</tbody></table></div></section>`;}
+export async function mountEfficientAD(root,{api,toast,modal}){
+ const current=++generation;
+ async function load(rebuild=true){
+  try{if(prefetched)prefetched=false;else snapshot=await api('/api/efficientad');if(current!==generation||!root.querySelector('.ea-workspace'))return;
+   if(!snapshot.ready){root.querySelector('#ea-content').innerHTML=`<section class="card pad"><h2>AI 서버 연결이 필요해요</h2><p class="muted">${esc(snapshot.reason)}</p><p class="smalltext">RTMDet 화면의 설정에서 AI 서버에 연결하면 두 작업 공간에서 같은 연결을 사용합니다.</p></section>`;return;}
+   if(rebuild){root.querySelector('#ea-content').innerHTML=tab==='test'?'<iframe class="ea-test-frame" title="EfficientAD 모델 테스트" src="/efficientad-test/"></iframe>':tab==='train'?training(snapshot):tab==='data'?datasets(snapshot):models(snapshot);bindForm();
+    const frame=root.querySelector('.ea-test-frame');
+    if(frame){const compact=()=>{const doc=frame.contentDocument;if(!doc?.head||doc.getElementById('studio-embed-style'))return;const style=doc.createElement('style');style.id='studio-embed-style';style.textContent='header{display:none!important}.layout{max-width:none!important;width:100%;margin:0!important;padding:0!important}';doc.head.append(style);};frame.addEventListener('load',compact);if(frame.contentDocument?.readyState==='complete')compact();}
+   }
+   else{const host=root.querySelector('#ea-jobs');if(host)host.innerHTML=jobs(snapshot.jobs);const run=root.querySelector('#ea-train button[type=submit]');if(run)run.disabled=snapshot.jobs.some(j=>['running','queued'].includes(j.status));}
+   root.querySelectorAll('[data-ea-tab]').forEach(b=>{b.classList.toggle('active',b.dataset.eaTab===tab);b.setAttribute('aria-pressed',b.dataset.eaTab===tab);});
+  }catch(e){toast(e.message,true);const h=root.querySelector('#ea-content');if(rebuild&&h)h.innerHTML=`<section class="card pad"><h2>서버 자료를 불러오지 못했어요</h2><p>${esc(e.message)}</p><button class="btn" data-ea="refresh">다시 불러오기</button></section>`;}
+ }
+ function bindForm(){const f=root.querySelector('#ea-train');if(!f)return;
+  const update=()=>{const d=snapshot.datasets.find(x=>x.id===f.elements.dataset.value);root.querySelector('#ea-dataset-counts').innerHTML=d?`<span>학습 <b>${num(d.counts.train)}</b>장</span><span>calibration <b>${num(d.counts.calibration)}</b>장</span><span>테스트 <b>${num(d.counts.test)}</b>장</span>`:'';};update();f.onchange=async e=>{remember(root);if(e.target.name==='kind'){draft.steps=draft.kind==='dense'?24:10000;draft.base='';draft.dataset='';await load();}else update();};f.oninput=()=>remember(root);
+  f.onsubmit=async e=>{e.preventDefault();remember(root);const b=f.querySelector('button[type=submit]');b.disabled=true;
+   try{await api('/api/efficientad',{action:'train',...draft});toast('EfficientAD 학습을 시작했습니다');await load();}catch(e){toast(e.message,true);b.disabled=false;}
+  };
+ }
+ root.onclick=async event=>{const t=event.target.closest('[data-ea-tab]'),b=event.target.closest('[data-ea]');
+  if(t){remember(root);tab=t.dataset.eaTab;await load();return;}
+  if(!b)return;const model=snapshot?.models.find(m=>m.id===b.dataset.id);
+  try{if(b.dataset.ea==='cancel'){await api('/api/efficientad',{action:'cancel',id:b.dataset.id});toast('학습 중단을 요청했습니다');await load();return;}
+   if(b.dataset.ea==='refresh'){remember(root);await load();return;}
+   if(b.dataset.ea==='log'){const r=await api('/api/efficientad',{action:'log',id:b.dataset.id});modal('EfficientAD 학습 로그',`<pre class="ea-log">${esc(r.text)}</pre>`);}
+   if(b.dataset.ea==='detail'){modal(title(model),`<div class="ea-model-detail"><p>${kinds[model.kind]}</p><p class="smalltext muted">${model.paths.map(esc).join('<br>')}</p><h3>학습 설정</h3><pre class="ea-log">${esc(JSON.stringify(model.config,null,2))}</pre><h3>평가 결과</h3><pre class="ea-log">${esc(JSON.stringify(model.metrics,null,2))}</pre></div>`);}
+   if(b.dataset.ea==='rename'){modal('모델 이름 변경',`<form id="ea-rename"><label class="field">표시 이름<input name="name" value="${esc(title(model))}" required maxlength="160"></label><p class="tiny muted">보관 폴더명은 유지하고 표시 이름을 변경합니다.</p><button class="btn primary">저장</button></form>`);document.querySelector('#ea-rename').onsubmit=async e=>{e.preventDefault();try{await api('/api/efficientad',{action:'rename',id:model.id,name:new FormData(e.target).get('name')});document.querySelector('#modal').close();await load();}catch(e){toast(e.message,true);}};}
+   if(b.dataset.ea==='use-model'){remember(root);draft.kind=model.kind==='dense'?'dense':'efficientad';draft.steps=draft.kind==='dense'?24:10000;draft.base=model.id;tab='train';await load();}
+   if(b.dataset.ea==='use-dataset'){remember(root);draft.kind=snapshot.datasets.find(d=>d.id===b.dataset.id)?.kind||'efficientad';draft.steps=draft.kind==='dense'?24:10000;draft.dataset=b.dataset.id;tab='train';await load();}
+  }catch(e){toast(e.message,true);}
+ };
+ await load();
+ async function poll(){if(current!==generation||!root.querySelector('.ea-workspace'))return;await load(false);setTimeout(poll,5000);}setTimeout(poll,5000);
+ return ()=>{remember(root);generation++;root.onclick=null;};
+}

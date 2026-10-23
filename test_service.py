@@ -13,17 +13,29 @@ class Inspection:
  def __init__(self,data,password):
   import paramiko
   self.data=Path(data);self.root=ROOT/'.runtime/model_test';self.root.mkdir(parents=True,exist_ok=True)
-  self.client=paramiko.SSHClient();self.client.load_system_host_keys();self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
-  self.client.connect(HOST,username=USER,password=password,look_for_keys=False,allow_agent=False,timeout=15)
-  self.client.get_transport().set_keepalive(20);self.jobs={};self.lock=threading.Lock();self.cache={}
-  self.command('mkdir -p '+shlex.quote(REMOTE))
-  with self.client.open_sftp() as s:
-   for name in ['worker.py','export_local.py','server_predict.py']:s.put(str(ROOT/name),REMOTE+'/'+name)
+  self.paramiko=paramiko;self.client=None;self.connection_lock=threading.RLock();self.jobs={};self.lock=threading.Lock();self.cache={};self.connection_error=None
+  try:self.ensure_connection(password)
+  except Exception:self.connection_error='AI 서버 연결 대기 중'
+ def ensure_connection(self,password=None):
+  from ssh_auth import open_client
+  with self.connection_lock:
+   transport=self.client.get_transport() if self.client else None
+   if transport and transport.is_active():return
+   candidate=open_client(self.paramiko,password)
+   try:
+    _,out,err=candidate.exec_command('mkdir -p '+shlex.quote(REMOTE));out.read();err.read()
+    if out.channel.recv_exit_status():raise RuntimeError('서버 작업 폴더에 접근할 수 없습니다')
+    with candidate.open_sftp() as s:
+     for name in ['worker.py','export_local.py','server_predict.py']:s.put(str(ROOT/name),REMOTE+'/'+name)
+   except Exception:candidate.close();raise
+   old=self.client;self.client=candidate;self.connection_error=None
+   if old:old.close()
  def models(self):
   c=sqlite3.connect((self.data/'studio.sqlite').resolve().as_uri()+'?mode=ro',uri=True)
   try:return [m for p, in c.execute("select payload from studio_records where kind='models'") if not (m:=json.loads(p)).get('deleted')]
   finally:c.close()
  def command(self,cmd):
+  self.ensure_connection()
   _,o,e=self.client.exec_command(cmd);output=o.read().decode('utf8','replace');error=e.read().decode('utf8','replace')
   if o.channel.recv_exit_status():raise RuntimeError(error[-2000:] or output[-2000:])
   return output
@@ -41,6 +53,7 @@ class Inspection:
   try:
    job.update(message='다른 테스트가 끝나기를 기다리는 중')
    with self.lock:
+    self.ensure_connection()
     model=next((m for m in self.models() if m['id']==body['model_id']),None)
     if model is None:raise ValueError('사용 가능한 모델을 선택하세요')
     ids=body['images'];files=[self.root/'images'/i for i in ids]
@@ -106,7 +119,9 @@ def serve(data,password,port=8899):
    if path in ('/styles.css','/inspect.js','/inspect_boot.js'):
     return self.response((ROOT/'web'/path[1:]).read_bytes(),ctype='text/css' if path.endswith('.css') else 'text/javascript')
    if path=='/models':return self.response([{k:m.get(k) for k in ('id','name','active')} for m in app.models()])
-   if path=='/health':return self.response(dict(local='CPUExecutionProvider',server=True))
+   if path=='/health':
+    try:app.ensure_connection();return self.response(dict(local='CPUExecutionProvider',server=True))
+    except Exception:return self.response(dict(local='CPUExecutionProvider',server=False,reason='AI 서버 자동 연결 대기 중'))
    if path.startswith('/jobs/'):
     job=app.jobs.get(path.split('/')[-1]);return self.response(job or {},200 if job else 404)
    if path.startswith('/images/'):
@@ -133,7 +148,8 @@ def serve(data,password,port=8899):
  server=ThreadingHTTPServer(('127.0.0.1',port),Handler);print(f'TEST_SERVICE_READY http://127.0.0.1:{port}',flush=True);server.serve_forever()
 
 if __name__=='__main__':
- p=argparse.ArgumentParser();p.add_argument('--data-dir');a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('--data-dir');p.add_argument('--password-stdin',action='store_true',help=argparse.SUPPRESS);a=p.parse_args()
  data=a.data_dir or str(ROOT/json.loads((ROOT/'.runtime/active-data.json').read_text())['data_dir'])
- password=getpass.getpass('SSH password (session only): ')
+ from ssh_auth import auto_available
+ password=json.loads(sys.stdin.readline())['password'] if a.password_stdin else (None if auto_available() else getpass.getpass('SSH password (session only): '))
  serve(data,password)

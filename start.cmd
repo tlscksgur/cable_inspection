@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-python server.py --port 8898
+python -X utf8 launch_studio.py
 pause

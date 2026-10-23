@@ -29,7 +29,7 @@ class SetupTests(unittest.TestCase):
             @classmethod
             def from_cfg(cls,cfg):
                 captured['cfg']=cfg
-                obj=cls();obj.test_dataloader=[1,2];obj.hooks=[];obj.message_hub=NS(runtime_info={},update_info=lambda *args:None);obj.val_loop=NS(run=lambda:captured.update(recovered_validation=True));return obj
+                obj=cls();obj.test_dataloader=[1,2];obj.hooks=[];obj.message_hub=NS(runtime_info={},update_info=lambda *args:None);obj.val_loop=NS(run=lambda:(captured.update(recovered_validation=True) or {'coco/segm_mAP_50':.75}));return obj
             def register_hook(self,hook,**kwargs):self.hooks.append(hook)
             def test(self):
                 cfg=captured['cfg']
@@ -50,6 +50,7 @@ class SetupTests(unittest.TestCase):
                 self.iter=1731;self.max_iters=69240;self.epoch=1;self.val_dataloader=[1,2]
                 for hook in self.hooks:
                     if hasattr(hook,'before_train'):hook.before_train(self)
+                for hook in self.hooks:
                     if hasattr(hook,'after_val_iter'):hook.after_val_iter(self,0)
                 raise TrainStopped()
         modules={
@@ -78,7 +79,11 @@ class SetupTests(unittest.TestCase):
                     self.assertEqual(result['metrics']['coco/segm_mAP_50'],.75)
                     self.assertEqual(result['version_id'],'fixed-valid')
                     self.assertEqual(json.loads((p/'status.json').read_text())['step'],2)
-            if resume_epoch==5:self.assertTrue(captured.get('recovered_validation'))
+            if resume_epoch==5 or (start_mode=='finetune' and not resume):self.assertTrue(captured.get('recovered_validation'))
+            if start_mode=='finetune' and not resume:
+                baseline=json.loads((p/'work'/'finetune_baseline.json').read_text())
+                self.assertEqual(baseline['metrics']['coco/segm_mAP_50'],.75)
+            elif mode=='train':self.assertFalse((p/'work'/'finetune_baseline.json').exists())
             return captured['cfg']
 
     def test_eval_uses_selected_checkpoint_valid_only_and_reports_results(self):
@@ -120,6 +125,15 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(cfg.train_dataloader['dataset']['pipeline'][1]['with_mask'],True)
 
 class CheckpointTests(unittest.TestCase):
+    def test_selected_checkpoint_follows_recorded_score_not_newest_timestamp(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent/'.verification') as folder:
+            work=Path(folder);baseline=work/'best_coco_segm_mAP_50_epoch_0.pth';baseline.write_bytes(b'better-start')
+            (work/'best_coco_segm_mAP_50_epoch_20.pth').write_bytes(b'newer-but-worse')
+            runner=NS(message_hub=NS(get_info=lambda key:str(baseline)))
+            self.assertEqual(worker.selected_best_checkpoint(runner,work),baseline.resolve())
+            baseline.unlink()
+            with self.assertRaisesRegex(RuntimeError,'저장 위치'):worker.selected_best_checkpoint(runner,work)
+
     def test_copying_previous_best_keeps_original_and_redirects_only_best_paths(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent/'.verification') as folder:
             root=Path(folder);old=root/'old';new=root/'new';old.mkdir();new.mkdir()
